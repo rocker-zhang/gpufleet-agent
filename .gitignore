@@ -1,0 +1,25 @@
+# Binaries
+/bin/
+/dist/
+gpufleet-agent
+*.exe
+*.out
+*.test
+
+# Coverage
+coverage.txt
+coverage.out
+
+# Go workspace / vendor noise
+/vendor/
+go.work
+go.work.sum
+
+# SBOM / supply-chain artifacts
+sbom.spdx.json
+*.sbom.json
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/

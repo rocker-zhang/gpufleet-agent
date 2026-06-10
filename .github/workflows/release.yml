@@ -1,0 +1,55 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write   # create the GitHub release + upload assets
+  id-token: write   # cosign keyless / Sigstore OIDC
+  attestations: write # SLSA provenance attestations
+
+jobs:
+  goreleaser:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+          cache: true
+
+      - name: install cosign
+        uses: sigstore/cosign-installer@v3
+      - name: install syft (SBOM)
+        uses: anchore/sbom-action/download-syft@v0
+
+      - name: run goreleaser (cross amd64+arm64 static)
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          version: "~> v2"
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: cosign sign checksums (keyless / OIDC)
+        run: |
+          cosign sign-blob --yes \
+            --output-signature dist/checksums.txt.sig \
+            --output-certificate dist/checksums.txt.pem \
+            dist/checksums.txt
+
+      - name: SLSA provenance attestation for built binaries
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: "dist/*.tar.gz"
+
+      - name: upload signing material to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/checksums.txt.sig
+            dist/checksums.txt.pem

@@ -1,0 +1,38 @@
+# GoReleaser config for the gpufleet agent (shipped binary).
+# arm64 is a first-class target. Builds are static (CGO disabled) and use the
+# default mock-NVML path — the `gpu` build tag is lab-only and never shipped.
+version: 2
+
+project_name: gpufleet-agent
+
+builds:
+  - id: agent
+    main: ./cmd/agent
+    binary: gpufleet-agent
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w -X main.version={{.Version}}
+    goos:
+      - linux
+    goarch:
+      - amd64
+      - arm64
+
+archives:
+  - id: agent
+    formats: [tar.gz]
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+
+checksum:
+  name_template: "checksums.txt"
+
+sboms:
+  - artifacts: archive
+
+# Keyless signing of checksums + SBOMs is performed in release.yml via cosign
+# with Sigstore OIDC; SLSA provenance is generated there too.
+release:
+  prerelease: auto
