@@ -1,14 +1,15 @@
-// Package agent is the read-only, off-critical-path collector/sidecar for
-// gpufleet. It reads existing telemetry sources (DCGM-exporter / Prometheus /
-// dmesg / NCCL) and emits a normalized evidence struct. It NEVER controls,
-// orchestrates, or checkpoints GPUs and is never in a job-execution path.
-//
-// The default build uses a mock metrics source (no GPU required). The real
-// NVML-backed reader is isolated behind the `gpu` build tag (see nvml_gpu.go),
-// so the standard CI build and the shipped binaries are CPU-only.
 package agent
 
 import "sort"
+
+// ----------------------------------------------------------------------------
+// Legacy single-reader evidence path (M1 scaffold).
+//
+// This pre-dates the multi-source Collector spine (collector.go) and is kept
+// for the simple `nvml_gpu.go` gpu-tagged reader and back-compat. New work
+// flows through Collector -> Normalize -> SignalWindow. Both paths are
+// read-only and off-critical-path.
+// ----------------------------------------------------------------------------
 
 // DeviceMetrics is one normalized device measurement read from a source.
 // All fields are already in normalized units; the agent does not interpret
