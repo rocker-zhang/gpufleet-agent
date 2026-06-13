@@ -53,6 +53,66 @@ Cards in `ops/BOARD.md` touching this module:
 - GPU path must still compile: `go build -tags gpu ./...` (NVML isolated behind `//go:build gpu`, lab-only, read-only queries).
 - **CI (one line):** mock build runs `go test -race` + `go vet`; the `-tags gpu` build is compile-checked.
 
+## 5a. `/cost` 本地只读 wire 契约 (TASK-0032)
+
+`GET /cost` is the agent's LOCAL read-only standalone cost-wedge endpoint
+(D-0010 Endpoint 1). It is **untyped JSON, NOT a proto message** — `/cost` is a
+local read-only API surface, not a controlplane contract, so it is intentionally
+NOT anchored in `proto/` (a proto upgrade would be an orchestrator contract
+decision, out of scope; RULES §D). Because the OPEN `cli` viewer must NOT link
+the agent Go module, it hand-copies these DTOs; this section is the single
+source of truth that both sides pin to, plus a committed golden fixture
+(`testdata/cost_golden.json`, byte-identical under `cli/testdata/`) and a
+contract test on each side decoding it (so the hand-copied DTO can't silently
+drift).
+
+```
+GET /cost  →  200  application/json
+{
+  "devices": [ <DeviceCost>, ... ],   // per-device wedge, sorted by uuid
+  "jobs":    [ <JobCost>,    ... ]     // per-job aggregate, sorted by job_id
+}
+```
+
+`DeviceCost` fields (all always present; no `omitempty`):
+
+| field             | type    | meaning |
+|-------------------|---------|---------|
+| `uuid`            | string  | device UUID |
+| `node`            | string  | node name |
+| `mfu`             | float   | model-FLOP-utilization fraction [0,1] |
+| `tensor_active`   | float   | tensor-active fraction [0,1] |
+| `idle_fraction`   | float   | `1-mfu` clamped [0,1]; basis for waste |
+| `cost_usd`        | float   | device spend over the window, USD |
+| `wasted_usd`      | float   | **per-WINDOW** waste = `cost_usd * idle_fraction`, USD |
+| `usd_per_hour`    | float   | **per-HOUR** burn RATE = `cost_per_hour * idle_fraction`, USD/hr (semantics `CostImpact.UsdPerHour`) |
+| `priced`          | bool    | `CostImpact.Computed`: a $/hr rate was known |
+| `low_utilization` | bool    | deterministic LOW_UTILIZATION rule fired (informational) |
+
+`JobCost` fields:
+
+| field          | type   | meaning |
+|----------------|--------|---------|
+| `job_id`       | string | job id |
+| `wasted_usd`   | float  | aggregate per-window waste across the job's priced devices |
+| `usd_per_hour` | float  | aggregate per-hour burn rate across the job's priced devices |
+| `priced`       | bool   | any device in the job was priced |
+| `devices`      | int    | device count in the job wedge |
+
+Semantics that consumers (cli) MUST honor:
+- `wasted_usd` (a window slice) and `usd_per_hour` (a rate) are **distinct**.
+  For a sub-hour window an idle device's `usd_per_hour` **exceeds** its
+  `wasted_usd`. A healthy device has both at `0`.
+- When `priced == false`, the `$` fields (`cost_usd`, `wasted_usd`,
+  `usd_per_hour`) are `0` and carry **no meaning** ("could not compute", never
+  "free"). The cli renders a **degrade mark, not `$0`** for these.
+- The agent **omits** (does not fabricate) a device whose MFU inputs were
+  degraded; such a device appears in `/signals` mappings but not in `/cost`
+  (the cli surfaces that as an `mfu` degrade mark).
+
+This is a **read-only透出** of `semantics.CostImpact` — no wedge compute change,
+no write-back (RULES §A).
+
 ## 6. session 工作规则
 - Edits **confined to this repo** (`agent/`). `proto/` read-only.
 - Need a change in `semantics`, `rca`, `cli`, `proto`, or the controlplane? **ABSTAIN and file a short blocker** (what you needed, which module/contract). No cross-repo workarounds.

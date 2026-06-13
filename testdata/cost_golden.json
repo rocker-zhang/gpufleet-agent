@@ -1,0 +1,68 @@
+{
+  "devices": [
+    {
+      "uuid": "GPU-mock-0001",
+      "node": "mock-node",
+      "mfu": 0.7,
+      "tensor_active": 0.7,
+      "idle_fraction": 0.30000000000000004,
+      "cost_usd": 0.018333333333333333,
+      "wasted_usd": 0.0055000000000000005,
+      "usd_per_hour": 0.33000000000000007,
+      "priced": true,
+      "low_utilization": false
+    },
+    {
+      "uuid": "GPU-mock-0002",
+      "node": "mock-node",
+      "mfu": 0.05,
+      "tensor_active": 0.05,
+      "idle_fraction": 0.95,
+      "cost_usd": 0.018333333333333333,
+      "wasted_usd": 0.017416666666666667,
+      "usd_per_hour": 1.045,
+      "priced": true,
+      "low_utilization": true
+    },
+    {
+      "uuid": "GPU-mock-0003",
+      "node": "mock-node",
+      "mfu": 0.4,
+      "tensor_active": 0.4,
+      "idle_fraction": 0.6,
+      "cost_usd": 0.018333333333333333,
+      "wasted_usd": 0.011,
+      "usd_per_hour": 0.66,
+      "priced": true,
+      "low_utilization": false
+    },
+    {
+      "uuid": "GPU-mock-unpriced",
+      "node": "mock-node",
+      "mfu": 0.05,
+      "tensor_active": 0.05,
+      "idle_fraction": 0.95,
+      "cost_usd": 0,
+      "wasted_usd": 0,
+      "usd_per_hour": 0,
+      "priced": false,
+      "low_utilization": true
+    }
+  ],
+  "jobs": [
+    {
+      "job_id": "job-idle-b",
+      "wasted_usd": 0.017416666666666667,
+      "usd_per_hour": 1.045,
+      "priced": true,
+      "devices": 1
+    },
+    {
+      "job_id": "job-train-a",
+      "wasted_usd": 0.0165,
+      "usd_per_hour": 0.9900000000000001,
+      "priced": true,
+      "devices": 2
+    }
+  ]
+}

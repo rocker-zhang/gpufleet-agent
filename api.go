@@ -94,6 +94,14 @@ func (a *API) handleSignals(w http.ResponseWriter, _ *http.Request) {
 }
 
 // DeviceCost is one device's cost wedge in the API's JSON shape.
+//
+// wasted_usd is the per-WINDOW attributed waste (CostUSD * idle over this
+// window); usd_per_hour is the per-HOUR burn RATE if the same idle condition
+// persists (semantics CostImpact.UsdPerHour = CostPerHour * idle). The two are
+// distinct quantities: for a sub-hour window an idle device's usd_per_hour
+// exceeds its wasted_usd (a rate vs. a window slice). Both are meaningful ONLY
+// when priced==true (semantics CostImpact.Computed); when priced==false they
+// are zero and carry NO meaning — the cli renders a degrade mark, not $0.
 type DeviceCost struct {
 	UUID           string  `json:"uuid"`
 	Node           string  `json:"node"`
@@ -102,16 +110,21 @@ type DeviceCost struct {
 	IdleFraction   float64 `json:"idle_fraction"`
 	CostUSD        float64 `json:"cost_usd"`
 	WastedUSD      float64 `json:"wasted_usd"`
+	UsdPerHour     float64 `json:"usd_per_hour"`
 	Priced         bool    `json:"priced"`
 	LowUtilization bool    `json:"low_utilization"`
 }
 
 // JobCost is one job's aggregated cost wedge in the API's JSON shape.
+//
+// wasted_usd / usd_per_hour mirror the per-device meaning, summed across the
+// job's priced devices (semantics aggregate CostImpact.UsdWindow / UsdPerHour).
 type JobCost struct {
-	JobID     string  `json:"job_id"`
-	WastedUSD float64 `json:"wasted_usd"`
-	Priced    bool    `json:"priced"`
-	Devices   int     `json:"devices"`
+	JobID      string  `json:"job_id"`
+	WastedUSD  float64 `json:"wasted_usd"`
+	UsdPerHour float64 `json:"usd_per_hour"`
+	Priced     bool    `json:"priced"`
+	Devices    int     `json:"devices"`
 }
 
 // CostResponse is the /cost payload.
@@ -131,16 +144,18 @@ func costResponse(st *State) CostResponse {
 			IdleFraction:   d.IdleFraction,
 			CostUSD:        d.Device.CostUSD,
 			WastedUSD:      d.WastedUSD,
+			UsdPerHour:     d.Impact.UsdPerHour,
 			Priced:         d.Impact.Computed,
 			LowUtilization: d.LowUtilization,
 		})
 	}
 	for _, j := range st.Cost.Jobs {
 		resp.Jobs = append(resp.Jobs, JobCost{
-			JobID:     j.Job.ID,
-			WastedUSD: j.Impact.UsdWindow,
-			Priced:    j.Impact.Computed,
-			Devices:   len(j.Wedges),
+			JobID:      j.Job.ID,
+			WastedUSD:  j.Impact.UsdWindow,
+			UsdPerHour: j.Impact.UsdPerHour,
+			Priced:     j.Impact.Computed,
+			Devices:    len(j.Wedges),
 		})
 	}
 	return resp
