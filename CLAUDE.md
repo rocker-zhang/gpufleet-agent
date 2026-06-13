@@ -277,13 +277,41 @@ are **unchanged**, so the §5a golden still decodes):
 |----------------|--------|---------|
 | `collected_at` | string | RFC3339 time of the last SUCCESSFUL collection |
 | `age_seconds`  | float  | `now − collected_at`, seconds |
-| `stale`        | bool   | `age_seconds` exceeded `--staleness-after` |
-| `stale_reason` | string | provenance when stale (e.g. "N consecutive collection failure(s): …"); empty when fresh |
+| `stale`        | bool   | `age_seconds` exceeded `--staleness-after`, OR `never_collected` |
+| `never_collected` | bool | no successful metrics scrape EVER (most stale; empty `devices`, 200 not 503) — TASK-0041 |
+| `stale_reason` | string | provenance when stale (e.g. "N consecutive collection failure(s): …" / "never collected: …"); empty when fresh |
 
 `GET /healthz` reflects `last_success_at`, `age_seconds`, `stale`,
-`stale_reason`, `consec_failures`. `ok` stays **true** even when stale — the
-agent process is healthy and off-path; staleness is a *data*-freshness signal,
-not a liveness failure.
+`never_collected`, `stale_reason`, `consec_failures`. `ok` stays **true** even
+when stale — the agent process is healthy and off-path; staleness is a
+*data*-freshness signal, not a liveness failure.
+
+**Never-collected = MOST stale (TASK-0041).** A distinct, worse case from
+"was-fresh-then-stale": the agent has **never once** successfully scraped metrics
+(e.g. the exporter was unreachable from startup), so there is **no last-known
+window to serve at all**. A never-collected agent is the *most* stale state and
+is **never** reported fresh (RULES §B). The lab found (#29) the opposite bug:
+`/healthz` reporting `stale:false` + `last_success_at:0001-01-01`(zero time) +
+`age_seconds:0`, and `/cost`→503. Corrected semantics:
+
+- `Freshness()` returns `stale=true` + `never_collected=true` (`HasData=false`)
+  with a populated `reason` ("never collected: no successful metrics scrape since
+  startup (…cause…)"). `age` is measured **since daemon startup**, never a
+  misleading `0` that would read as "just collected".
+- `/healthz`: `stale=true`, `never_collected=true`, **no** `last_success_at`
+  (omitted — never a zero-time fake), `age_seconds` = since-startup.
+- `/cost`: returns **200 (not 503)** with **empty** `devices`/`jobs`,
+  `stale=true`, `never_collected=true`, and a `stale_reason` — a self-consistent,
+  machine-readable empty state. `collected_at` is omitted (there is none).
+
+The cli renders this as a clear **"NO DATA — the agent has not collected any GPU
+metrics yet"** message + the agent's reason, never a blank table and never a raw
+HTTP error. For resilience it also degrades an **older** agent's `503` on `/cost`
+into the same never-collected empty state (carrying the agent's body as the
+reason). A reachable-but-empty agent (never-collected, `200`/`503`) is kept
+distinct from an **unreachable** agent (transport error ⇒ cli still says "cannot
+reach the agent"). The `/cost`/`/healthz` `never_collected` field is **additive**
+untyped JSON (NOT proto — §5a/§D): no `proto/` change, so `/signals` is untouched.
 
 **Proto note (§D, ABSTAIN).** Freshness is exposed on the agent's untyped `/cost`
 + `/healthz` only. Putting it into the proto-typed `/signals` EvidencePack would

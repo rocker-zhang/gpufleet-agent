@@ -5,11 +5,15 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
 	"time"
+
+	gpufleetv1 "github.com/rocker-zhang/gpufleet-proto/gen/go/gpufleet/v1"
 )
 
 // dcgmFixtureServer serves the committed DCGM-exporter text fixture so a real
@@ -213,8 +217,10 @@ func TestFreshnessStaleWhenMetricsDieButLogSourceAlive(t *testing.T) {
 }
 
 // TestFreshnessNoDataBeforeFirstCollection proves freshness is well-defined
-// before any collection: HasData=false, Stale=false (there is no held window to
-// flag — distinct from holding stale data).
+// before any collection: HasData=false, and (TASK-0041, revising the original
+// TASK-0040 semantics) the never-collected state is the MOST stale, so Stale=true
+// + NeverCollected=true with a populated reason. The lab found that reporting
+// not-stale here was a real bug — a never-collected agent is never fresh.
 func TestFreshnessNoDataBeforeFirstCollection(t *testing.T) {
 	d := NewDaemon(DaemonConfig{
 		Window:         time.Minute,
@@ -226,8 +232,145 @@ func TestFreshnessNoDataBeforeFirstCollection(t *testing.T) {
 	if fr.HasData {
 		t.Fatalf("no collection yet ⇒ HasData must be false")
 	}
-	if fr.Stale {
-		t.Fatalf("no data is not 'stale data' — Stale must be false, got %+v", fr)
+	if !fr.NeverCollected {
+		t.Fatalf("no collection yet ⇒ NeverCollected must be true, got %+v", fr)
+	}
+	if !fr.Stale {
+		t.Fatalf("never-collected is the MOST stale state — Stale must be true (TASK-0041), got %+v", fr)
+	}
+	if fr.Reason == "" {
+		t.Fatalf("never-collected must carry a populated reason, got %+v", fr)
+	}
+}
+
+// failingCollector always errors — it models a metrics exporter that is
+// unreachable FROM THE START, so the daemon NEVER once successfully scrapes
+// metrics. Its source is the DCGM-exporter class (a metrics source) so a total
+// failure drives the never-collected path.
+type failingCollector struct{ err error }
+
+func (f failingCollector) Source() gpufleetv1.SignalSource {
+	return gpufleetv1.SignalSource_SIGNAL_SOURCE_DCGM
+}
+
+func (f failingCollector) Collect(time.Time, time.Duration) (Observation, error) {
+	return Observation{}, f.err
+}
+
+// TestFreshnessNeverCollectedIsStale is the TASK-0041 core DoD: when the exporter
+// is unreachable from startup so the agent NEVER successfully collects once,
+// Freshness must report the MOST-stale state — Stale=true, NeverCollected=true,
+// HasData=false, a POPULATED reason, and an age measured SINCE STARTUP (never a
+// misleading 0 that reads as "just collected / fresh"). The lab bug was the
+// opposite: stale=false + age 0 on a never-collected agent.
+func TestFreshnessNeverCollectedIsStale(t *testing.T) {
+	clk := &manualClock{t: time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)}
+	d := NewDaemon(DaemonConfig{
+		AgentID:        "never",
+		Window:         time.Minute,
+		StalenessAfter: 10 * time.Second,
+		Collectors:     []Collector{failingCollector{err: errors.New("dial tcp 127.0.0.1:9: connect: connection refused")}},
+		Policy:         DefaultCostPolicy(),
+		Now:            clk.now,
+	})
+
+	// Several failing collections — daemon must not crash and must publish nothing.
+	for i := 0; i < 3; i++ {
+		clk.advance(4 * time.Second)
+		if err := d.Refresh(context.Background()); err == nil {
+			t.Fatalf("Refresh against a never-reachable exporter should surface an error")
+		}
+	}
+	if d.CostSnapshot() != nil {
+		t.Fatalf("never-collected agent must have NO cost-bearing window")
+	}
+
+	fr := d.Freshness()
+	if fr.HasData {
+		t.Fatalf("never-collected ⇒ HasData must be false: %+v", fr)
+	}
+	if !fr.NeverCollected {
+		t.Fatalf("never-collected ⇒ NeverCollected must be true: %+v", fr)
+	}
+	if !fr.Stale {
+		t.Fatalf("never-collected is the MOST stale state — Stale must be true (the lab bug was stale=false): %+v", fr)
+	}
+	if fr.Reason == "" {
+		t.Fatalf("never-collected must carry a populated reason: %+v", fr)
+	}
+	if !strings.Contains(fr.Reason, "never collected") {
+		t.Fatalf("reason should name the never-collected condition, got %q", fr.Reason)
+	}
+	// Age is measured SINCE STARTUP: the clock advanced 3×4s=12s past construction,
+	// so it must be a real positive age, NOT a misleading 0.
+	if fr.Age <= 0 {
+		t.Fatalf("never-collected age must be since-startup (>0), never a misleading 0: %+v", fr)
+	}
+	if fr.Age != 12*time.Second {
+		t.Fatalf("never-collected age should be since-startup = 12s, got %v", fr.Age)
+	}
+}
+
+// TestHealthAndCostNeverCollected proves the wire surfaces (TASK-0041): on a
+// never-collected agent /healthz reports stale=true + never_collected=true with
+// NO last_success_at (omitted, not a zero time) and a >0 age_seconds; /cost
+// returns 200 (NOT 503) with empty devices + stale=true + never_collected=true +
+// a reason — the self-consistent empty state the cli renders gracefully.
+func TestHealthAndCostNeverCollected(t *testing.T) {
+	clk := &manualClock{t: time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)}
+	d := NewDaemon(DaemonConfig{
+		AgentID:        "never-wire",
+		Window:         time.Minute,
+		StalenessAfter: 10 * time.Second,
+		Collectors:     []Collector{failingCollector{err: errors.New("connection refused")}},
+		Policy:         DefaultCostPolicy(),
+		Now:            clk.now,
+	})
+	clk.advance(7 * time.Second)
+	_ = d.Refresh(context.Background()) // fails; nothing published
+
+	srv := httptest.NewServer(NewAPI(d).Handler())
+	defer srv.Close()
+
+	// /healthz: stale=true, never_collected=true, no last_success_at, age>0.
+	hb := httpGet(t, srv.URL+"/healthz", http.StatusOK)
+	var health HealthResponse
+	if err := json.Unmarshal(hb, &health); err != nil {
+		t.Fatalf("decode /healthz: %v", err)
+	}
+	if !health.OK {
+		t.Fatalf("/healthz ok stays true (process healthy, off-path): %+v", health)
+	}
+	if !health.Stale || !health.NeverCollected {
+		t.Fatalf("never-collected /healthz must be stale=true + never_collected=true: %+v", health)
+	}
+	if health.LastSuccessAt != nil {
+		t.Fatalf("never-collected /healthz must NOT report a last_success_at (no zero-time fakery): %+v", health)
+	}
+	if health.AgeSeconds <= 0 {
+		t.Fatalf("never-collected age_seconds must be since-startup (>0), never a misleading 0: %+v", health)
+	}
+	if health.StaleReason == "" {
+		t.Fatalf("never-collected /healthz must carry a stale_reason: %+v", health)
+	}
+
+	// /cost: 200, NOT 503 — empty devices + stale + never_collected + reason.
+	cb := httpGet(t, srv.URL+"/cost", http.StatusOK)
+	var cost CostResponse
+	if err := json.Unmarshal(cb, &cost); err != nil {
+		t.Fatalf("decode /cost: %v", err)
+	}
+	if len(cost.Devices) != 0 || len(cost.Jobs) != 0 {
+		t.Fatalf("never-collected /cost must have empty devices/jobs: %+v", cost)
+	}
+	if !cost.Stale || !cost.NeverCollected {
+		t.Fatalf("never-collected /cost must be stale=true + never_collected=true: %+v", cost)
+	}
+	if cost.StaleReason == "" {
+		t.Fatalf("never-collected /cost must carry a stale_reason: %+v", cost)
+	}
+	if cost.CollectedAt != nil {
+		t.Fatalf("never-collected /cost must NOT report a collected_at: %+v", cost)
 	}
 }
 
@@ -266,7 +409,7 @@ func TestHealthAndCostReportFreshness(t *testing.T) {
 	if health.Stale {
 		t.Fatalf("fresh mock default must not be stale on /healthz: %+v", health)
 	}
-	if health.LastSuccessAt.IsZero() {
+	if health.LastSuccessAt == nil || health.LastSuccessAt.IsZero() {
 		t.Fatalf("/healthz must report last_success_at after a successful collection")
 	}
 
@@ -279,7 +422,7 @@ func TestHealthAndCostReportFreshness(t *testing.T) {
 	if cost.Stale {
 		t.Fatalf("fresh mock default /cost must not be stale: %+v", cost)
 	}
-	if cost.CollectedAt.IsZero() {
+	if cost.CollectedAt == nil || cost.CollectedAt.IsZero() {
 		t.Fatalf("/cost must report collected_at")
 	}
 	if cost.StaleReason != "" {

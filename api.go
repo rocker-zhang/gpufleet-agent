@@ -66,16 +66,27 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 // older than the staleness threshold (so a consumer must NOT treat it as live).
 // OK stays true even when stale — the agent process is healthy and off-path; a
 // stale data window is a data-freshness signal, not a liveness failure.
+//
+// NeverCollected (TASK-0041) marks the MOST-stale case: the agent has not once
+// successfully scraped metrics (e.g. exporter unreachable from startup). It is
+// reported stale=true with NO last_success_at (there is none — the field is
+// omitted rather than a misleading zero time) and age_seconds measured SINCE
+// STARTUP, never a misleading 0. A never-collected agent is never reported fresh.
 type HealthResponse struct {
-	OK             bool      `json:"ok"`
-	Refreshes      uint64    `json:"refreshes"`
-	Errors         uint64    `json:"errors"`
-	RefreshAt      time.Time `json:"refresh_at,omitempty"`
-	LastSuccessAt  time.Time `json:"last_success_at,omitempty"`
-	AgeSeconds     float64   `json:"age_seconds"`
-	Stale          bool      `json:"stale"`
-	StaleReason    string    `json:"stale_reason,omitempty"`
-	ConsecFailures uint64    `json:"consec_failures"`
+	OK        bool   `json:"ok"`
+	Refreshes uint64 `json:"refreshes"`
+	Errors    uint64 `json:"errors"`
+	// RefreshAt / LastSuccessAt are POINTERS so a never-collected agent OMITS them
+	// on the wire entirely (a value-typed time.Time always serializes its zero
+	// "0001-01-01T00:00:00Z", which would read as a misleading collection time —
+	// TASK-0041). nil ⇒ absent.
+	RefreshAt      *time.Time `json:"refresh_at,omitempty"`
+	LastSuccessAt  *time.Time `json:"last_success_at,omitempty"`
+	AgeSeconds     float64    `json:"age_seconds"`
+	Stale          bool       `json:"stale"`
+	NeverCollected bool       `json:"never_collected"`
+	StaleReason    string     `json:"stale_reason,omitempty"`
+	ConsecFailures uint64     `json:"consec_failures"`
 }
 
 func (a *API) handleHealth(w http.ResponseWriter, _ *http.Request) {
@@ -85,15 +96,24 @@ func (a *API) handleHealth(w http.ResponseWriter, _ *http.Request) {
 		OK:             true,
 		Errors:         a.d.Errs(),
 		Stale:          fr.Stale,
+		NeverCollected: fr.NeverCollected,
 		StaleReason:    fr.Reason,
 		ConsecFailures: fr.ConsecFails,
 	}
 	if st != nil {
 		resp.Refreshes = st.Refreshes
-		resp.RefreshAt = st.RefreshAt
+		ra := st.RefreshAt
+		resp.RefreshAt = &ra
 	}
 	if fr.HasData {
-		resp.LastSuccessAt = fr.CollectedAt
+		// Last-known cost-bearing collection: report its time + age.
+		ca := fr.CollectedAt
+		resp.LastSuccessAt = &ca
+		resp.AgeSeconds = fr.Age.Seconds()
+	} else if fr.NeverCollected {
+		// Never collected (TASK-0041): there is NO last_success_at — omit it rather
+		// than emit a misleading zero time. Report age SINCE STARTUP so age_seconds
+		// is never a misleading 0 that reads as "just collected".
 		resp.AgeSeconds = fr.Age.Seconds()
 	}
 	writeJSON(w, http.StatusOK, resp)
@@ -162,13 +182,24 @@ type JobCost struct {
 // fabricated) but MUST be presented as stale, not current (RULES §B). When fresh,
 // stale=false and stale_reason is empty; the device/job fields are unchanged from
 // before this task (backward compatible — the per-device DTOs did not change).
+// NeverCollected (TASK-0041) is the MOST-stale case: the agent has not once
+// successfully scraped metrics, so there is no last-known window to serve at all.
+// On never-collected /cost returns 200 (NOT 503) with Devices/Jobs empty,
+// Stale=true, NeverCollected=true, and a populated StaleReason — self-consistent,
+// machine-readable, and rendered by the cli as a clear "not collected yet"
+// message rather than a raw HTTP error or a silent blank (RULES §B).
 type CostResponse struct {
-	Devices     []DeviceCost `json:"devices"`
-	Jobs        []JobCost    `json:"jobs"`
-	CollectedAt time.Time    `json:"collected_at,omitempty"`
-	AgeSeconds  float64      `json:"age_seconds"`
-	Stale       bool         `json:"stale"`
-	StaleReason string       `json:"stale_reason,omitempty"`
+	Devices []DeviceCost `json:"devices"`
+	Jobs    []JobCost    `json:"jobs"`
+	// CollectedAt is a POINTER so a never-collected response OMITS it (a value-typed
+	// time.Time always serializes its zero "0001-01-01T00:00:00Z", a misleading
+	// fake collection time — TASK-0041). nil ⇒ absent; the cli's value-typed mirror
+	// simply stays zero when the field is absent (wire-compatible).
+	CollectedAt    *time.Time `json:"collected_at,omitempty"`
+	AgeSeconds     float64    `json:"age_seconds"`
+	Stale          bool       `json:"stale"`
+	NeverCollected bool       `json:"never_collected"`
+	StaleReason    string     `json:"stale_reason,omitempty"`
 }
 
 func costResponse(st *State) CostResponse {
@@ -204,9 +235,16 @@ func costResponse(st *State) CostResponse {
 // data-age + stale fields and never present a held-stale window as current.
 func stampFreshness(resp CostResponse, fr Freshness) CostResponse {
 	resp.Stale = fr.Stale
+	resp.NeverCollected = fr.NeverCollected
 	resp.StaleReason = fr.Reason
 	if fr.HasData {
-		resp.CollectedAt = fr.CollectedAt
+		// Age of the last-known window + its (real) collection time.
+		ca := fr.CollectedAt
+		resp.CollectedAt = &ca
+		resp.AgeSeconds = fr.Age.Seconds()
+	} else if fr.NeverCollected {
+		// Age SINCE STARTUP (never a misleading 0). CollectedAt is OMITTED — there is
+		// no successful collection time to report (never a zero-time fake).
 		resp.AgeSeconds = fr.Age.Seconds()
 	}
 	return resp
@@ -218,7 +256,12 @@ func (a *API) handleCost(w http.ResponseWriter, _ *http.Request) {
 	// and stampFreshness flags it stale so the reader never treats it as live.
 	st := a.d.CostSnapshot()
 	if st == nil {
-		http.Error(w, "no signal window collected yet", http.StatusServiceUnavailable)
+		// NEVER COLLECTED (TASK-0041): no successful metrics scrape ever, so there is
+		// no last-known window. Return 200 (NOT 503) with empty devices/jobs +
+		// stale=true + never_collected=true + a populated reason — a self-consistent,
+		// machine-readable empty state the cli renders as a clear "agent has not
+		// collected data yet" message (never a raw HTTP error, never a silent blank).
+		writeJSON(w, http.StatusOK, stampFreshness(CostResponse{}, a.d.Freshness()))
 		return
 	}
 	writeJSON(w, http.StatusOK, stampFreshness(costResponse(st), a.d.Freshness()))

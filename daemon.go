@@ -42,11 +42,20 @@ type State struct {
 // as stale, not current. Reason carries the provenance of WHY (exporter
 // unreachable / N consecutive collection failures). HasData is false before the
 // very first successful collection — there is no last-known value to flag yet.
+//
+// NeverCollected (TASK-0041) is the distinct, MOST-stale case: the agent has
+// NEVER once successfully scraped metrics (costState is nil) — e.g. the exporter
+// was unreachable from startup. There is no last-known value to serve at all, so
+// this is reported Stale=true (NeverCollected=true) with a populated Reason
+// ("never collected: …") and an Age measured SINCE STARTUP — never a misleading
+// age 0 that would read as "just collected / fresh". A never-collected agent is
+// the most stale state and must NEVER be reported fresh (RULES §B).
 type Freshness struct {
-	HasData        bool          // a State has been published at least once
-	CollectedAt    time.Time     // RefreshAt of the live State (last successful collection)
-	Age            time.Duration // now - CollectedAt (0 when !HasData)
-	Stale          bool          // Age exceeded the staleness threshold
+	HasData        bool          // a cost-bearing State has been published at least once
+	NeverCollected bool          // no successful metrics scrape EVER (most stale; !HasData)
+	CollectedAt    time.Time     // RefreshAt of the live State (last successful collection); zero when NeverCollected
+	Age            time.Duration // now - CollectedAt when HasData; now - StartedAt when NeverCollected
+	Stale          bool          // Age exceeded the staleness threshold, OR NeverCollected
 	Reason         string        // provenance for Stale (empty when fresh)
 	StalenessAfter time.Duration // the threshold in effect
 	ConsecFails    uint64        // consecutive failed collections since the last success
@@ -65,6 +74,7 @@ type Daemon struct {
 	collectors     []Collector
 	policy         semantics.CostPolicy
 	now            func() time.Time
+	startedAt      time.Time // daemon construction time; ages the never-collected case (TASK-0041)
 
 	mu    sync.RWMutex
 	state *State // freshest published window (incl. log/XID-only cycles); serves /signals
@@ -136,6 +146,7 @@ func NewDaemon(cfg DaemonConfig) *Daemon {
 		collectors:     cfg.Collectors,
 		policy:         policy,
 		now:            cfg.Now,
+		startedAt:      cfg.Now(),
 	}
 }
 
@@ -303,6 +314,19 @@ func stalenessReason(consecFails uint64, err error, fallback string) string {
 	}
 }
 
+// neverCollectedReason renders the provenance for the never-collected verdict
+// (TASK-0041): the agent has not yet succeeded even once. It folds in the last
+// metrics-collection failure reason (exporter unreachable, etc.) when one was
+// recorded, so the operator sees WHY no data exists, and otherwise states plainly
+// that no collection has completed yet. Always non-empty.
+func neverCollectedReason(lastReason string) string {
+	const base = "never collected: no successful metrics scrape since startup"
+	if lastReason != "" {
+		return base + " (" + lastReason + ")"
+	}
+	return base
+}
+
 // Snapshot returns the latest published State (the freshest window, including a
 // log/XID-only cycle), or nil if no refresh has run. This drives /signals. The
 // returned pointer is immutable; callers must not mutate it.
@@ -352,9 +376,20 @@ func (d *Daemon) Freshness() Freshness {
 
 	f := Freshness{StalenessAfter: d.stalenessAfter, ConsecFails: consec}
 	if st == nil {
-		// No window ever collected: nothing to serve, so nothing to mark stale.
-		// HasData=false tells the reader there is simply no data yet (distinct
-		// from "held stale data").
+		// NEVER COLLECTED (TASK-0041): the agent has not once successfully scraped
+		// metrics — e.g. the exporter was unreachable from startup. This is the MOST
+		// stale state, not a fresh one: there is no last-known value to serve at all.
+		// Report Stale=true + NeverCollected=true with a populated reason, and age
+		// the data SINCE STARTUP (never a misleading 0 that would read as "just
+		// collected"). RULES §B: never present never-collected as current/fresh.
+		f.NeverCollected = true
+		f.Stale = true
+		age := d.now().Sub(d.startedAt)
+		if age < 0 {
+			age = 0 // clock-skew guard
+		}
+		f.Age = age
+		f.Reason = neverCollectedReason(reason)
 		return f
 	}
 	f.HasData = true
