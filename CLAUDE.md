@@ -113,6 +113,41 @@ Semantics that consumers (cli) MUST honor:
 This is a **read-only透出** of `semantics.CostImpact` — no wedge compute change,
 no write-back (RULES §A).
 
+## 5b. 指向真实端点 (point at real Prometheus/DCGM — TASK-0037)
+
+By default `agent -serve` runs the **mock** collectors (demo1 / CI, GPU-less). To
+read **real** telemetry in the lab, pass endpoint flags (or the equivalent env
+vars). HTTP scrape needs **no NVML** — the real `PrometheusCollector` /
+`DCGMExporterCollector` compile in the default `!gpu` build, so real-endpoint
+collection works **without `-tags gpu`** (NVML/kmsg is only for the gpu build).
+
+```sh
+# Real read-only collection on the default (no-NVML) build:
+agent -serve \
+  --prometheus-url     http://prometheus:9090 \
+  --dcgm-exporter-url  http://127.0.0.1:9400/metrics \
+  --node $NODE_NAME
+```
+
+| flag | env | meaning |
+|------|-----|---------|
+| `--prometheus-url` | `GPUFLEET_PROMETHEUS_URL` | EXISTING Prometheus root; read-only PromQL instant queries, **zero new scrape load** (preferred metrics source). |
+| `--dcgm-exporter-url` | `GPUFLEET_DCGM_EXPORTER_URL` | local DCGM-exporter `/metrics`; read-only fallback scrape. |
+| `--collectors` | `GPUFLEET_COLLECTORS` | `auto` (default: real if any endpoint given, else mock) \| `mock` \| `real`. |
+| `--nccl-log` | `GPUFLEET_NCCL_LOG` | NCCL log file to tail read-only (real collectors only). |
+| `--profiling-burst` | `GPUFLEET_PROFILING_BURST` | opt into high-res DCGM profiling scrapes (default off). |
+| `--profiling-cap` | `GPUFLEET_PROFILING_CAP` | min interval between profiling-burst scrapes (the off-path frequency cap, D-0009). |
+
+When an endpoint is given the daemon wires the REAL `MetricsChain`
+(Prometheus-first → DCGM fallback, `NewMetricsChain`) + the log/event collector,
+replacing the mock `DefaultCollectors`. **With NO endpoint flags the behavior is
+unchanged** (mock default, demo1 green). An **unreachable/garbage endpoint**
+degrades through the existing chain (mark+degrade) — it **never crashes** the
+daemon or affects a job (RULES §A). Default PromQL expressions assume
+DCGM-exporter labeling (`DefaultPromQueries`); override via the package
+`RuntimeConfig.Queries` if your labels differ. Everything here is **read-only**
+config + read endpoints — zero write-back.
+
 ## 6. session 工作规则
 - Edits **confined to this repo** (`agent/`). `proto/` read-only.
 - Need a change in `semantics`, `rca`, `cli`, `proto`, or the controlplane? **ABSTAIN and file a short blocker** (what you needed, which module/contract). No cross-repo workarounds.

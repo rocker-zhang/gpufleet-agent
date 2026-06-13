@@ -18,6 +18,10 @@ query — never device control.
 ```sh
 go run ./cmd/agent --node my-host         # mock source, prints evidence JSON
 go build -tags gpu ./cmd/agent            # lab-only NVML-backed build
+
+# Point at REAL telemetry (read-only HTTP scrape, no NVML / no -tags gpu needed):
+agent -serve --prometheus-url http://prometheus:9090 \
+             --dcgm-exporter-url http://127.0.0.1:9400/metrics --node my-host
 ```
 
 ## Evidence is the only thing that leaves
