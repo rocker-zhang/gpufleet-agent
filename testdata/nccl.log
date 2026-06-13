@@ -1,0 +1,4 @@
+lab-node-1:4321:4399 [0] NCCL INFO Bootstrap : Using eth0:10.0.0.1<0>
+lab-node-1:4321:4399 [0] NCCL INFO comm 0x55ab12cd rank 0 nranks 8 AllReduce completed in 1200 us
+lab-node-1:4321:4399 [3] NCCL WARN [Watchdog] NCCL timeout detected on rank 3 for AllReduce, comm 0x55ab12cd, timed out after 1800000 ms
+lab-node-1:4321:4399 [0] NCCL INFO comm 0x55ab12cd rank 0 Broadcast completed in 80 us

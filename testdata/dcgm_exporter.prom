@@ -1,0 +1,14 @@
+# HELP DCGM_FI_PROF_PIPE_TENSOR_ACTIVE Ratio of cycles the tensor pipes are active.
+# TYPE DCGM_FI_PROF_PIPE_TENSOR_ACTIVE gauge
+DCGM_FI_PROF_PIPE_TENSOR_ACTIVE{gpu="0",UUID="GPU-fixture-0001",modelName="NVIDIA A10",Hostname="lab-node-1"} 0.7100
+DCGM_FI_PROF_PIPE_TENSOR_ACTIVE{gpu="1",UUID="GPU-fixture-0002",modelName="NVIDIA A10",Hostname="lab-node-1"} 0.0400
+# HELP DCGM_FI_PROF_SM_ACTIVE Ratio of cycles an SM has at least one warp assigned.
+# TYPE DCGM_FI_PROF_SM_ACTIVE gauge
+DCGM_FI_PROF_SM_ACTIVE{gpu="0",UUID="GPU-fixture-0001",modelName="NVIDIA A10",Hostname="lab-node-1"} 0.8300
+DCGM_FI_PROF_SM_ACTIVE{gpu="1",UUID="GPU-fixture-0002",modelName="NVIDIA A10",Hostname="lab-node-1"} 0.0900
+# HELP DCGM_FI_PROF_DRAM_ACTIVE Ratio of cycles the device memory interface is active.
+# TYPE DCGM_FI_PROF_DRAM_ACTIVE gauge
+DCGM_FI_PROF_DRAM_ACTIVE{gpu="0",UUID="GPU-fixture-0001",modelName="NVIDIA A10",Hostname="lab-node-1"} 0.5500
+DCGM_FI_PROF_DRAM_ACTIVE{gpu="1",UUID="GPU-fixture-0002",modelName="NVIDIA A10",Hostname="lab-node-1"} 0.0200
+# A non-DCGM line that must be ignored by the parser.
+go_goroutines 42

@@ -22,14 +22,7 @@ import (
 //   - a device whose PEAK is missing from one source (GPU-mock-0003): proves
 //     missing-field degradation (MFU cannot be computed ⇒ marked, not faked).
 
-const (
-	mockNode = "mock-node"
-
-	// dcgmFIProfPipeTensorActive is the public DCGM profiling field id/symbol the
-	// real DCGM-exporter exposes; carried raw, semantics derived downstream.
-	dcgmFIProfPipeTensorActive = 1003
-	dcgmSymPipeTensorActive    = "DCGM_FI_PROF_PIPE_TENSOR_ACTIVE"
-)
+const mockNode = "mock-node"
 
 // MockDCGMCollector emits DCGM-exporter-shaped device measurements: per-device
 // achieved-FLOP/peak and tensor-active samples. It does NOT supply device->job

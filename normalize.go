@@ -90,6 +90,7 @@ func Normalize(agentID string, now time.Time, window time.Duration, obs []Observ
 		}
 		pack.DcgmSeries = append(pack.DcgmSeries, o.DcgmSeries...)
 		pack.XidEvents = append(pack.XidEvents, o.XidEvents...)
+		pack.NcclEvents = append(pack.NcclEvents, o.NcclEvents...)
 
 		for _, m := range o.Mappings {
 			// Last writer wins only if a prior source left job empty; otherwise

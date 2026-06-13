@@ -59,6 +59,11 @@ type Observation struct {
 	// XidEvents are discrete kernel/XID fault events observed in the window.
 	XidEvents []*gpufleetv1.XidEvent
 
+	// NcclEvents are collective-communication observations (timeouts, slow
+	// all-reduce, rank desync) parsed from NCCL logs in the window. Carried raw;
+	// they are wire-level observations, never a fault verdict (RULES §B).
+	NcclEvents []*gpufleetv1.NcclEvent
+
 	// DeviceWindows are per-device measured aggregates the normalizer feeds to
 	// the standalone cost wedge. They are kept separate from DcgmSeries because
 	// the cost wedge consumes scalar window aggregates, not raw sample streams.

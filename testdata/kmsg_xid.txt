@@ -1,0 +1,4 @@
+6,1234,567890123,-;NVRM: loading NVIDIA UNIX x86_64 Kernel Module
+3,1235,567890456,-;NVRM: Xid (PCI:0000:65:00): 79, pid=4321, GPU has fallen off the bus.
+6,1236,567890999,-;systemd[1]: Started Session 12 of user lab.
+3,1237,567891555,-;NVRM: Xid (PCI:0000:b3:00): 48, pid=4321, Double Bit ECC Error GPU-aabbccdd-1122-3344-5566-77889900aabb
