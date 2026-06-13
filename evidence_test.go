@@ -25,23 +25,8 @@ func TestCollectDeterministicOrder(t *testing.T) {
 	}
 }
 
-func TestMockReaderShape(t *testing.T) {
-	ev, err := Collect(DefaultReader("test-node"))
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if ev.Source != "mock" {
-		t.Fatalf("default (no-gpu) build should use mock source, got %q", ev.Source)
-	}
-	if len(ev.Devices) != 2 {
-		t.Fatalf("want 2 mock devices, got %d", len(ev.Devices))
-	}
-	for _, d := range ev.Devices {
-		if d.Node != "test-node" {
-			t.Errorf("node not propagated: %q", d.Node)
-		}
-		if d.WindowSeconds <= 0 {
-			t.Errorf("non-positive window for %s", d.UUID)
-		}
-	}
-}
+// TestMockReaderShape (the default-build mock-shape assertions) lives in
+// evidence_mock_test.go (//go:build !gpu); the gpu build exercises the real
+// DefaultReader path in evidence_gpu_test.go (skip-not-fail when NVML is
+// unwired). DefaultReader's concrete type is build-specific, so the shape
+// assertions cannot be shared across both builds.

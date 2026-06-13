@@ -72,15 +72,30 @@ type kmsgLogSource struct {
 }
 
 // SetKill wires the daemon's kill-switch channel into this source so a shutdown /
-// operator abort can interrupt an in-flight /dev/kmsg drain (TASK-0033 #1). It
-// lazily allocates the shared cell so the source need not be constructed with one
-// (kmsgLogSource is value-stored; the pointer cell is what survives the copy). It
-// is the killWirable implementation the daemon discovers via LogEventCollector.
+// operator abort can interrupt an in-flight /dev/kmsg drain (TASK-0033 #1). It is
+// the killWirable implementation the daemon discovers via LogEventCollector.
+//
+// The shared cell is allocated at construction (newKmsgLogSource / the
+// DefaultCollectors fixture below); SetKill therefore only mutates the cell via
+// its lock-guarded set, never the s.kill field itself. This keeps SetKill
+// race-safe regardless of call-site ordering (TASK-0034 #2) — the previous lazy
+// `s.kill = &killCell{}` was an unsynchronized field write. killCell.set is
+// nil-safe, so a source built without a cell still degrades (no kill-switch)
+// rather than racing.
 func (s *kmsgLogSource) SetKill(kill <-chan struct{}) {
-	if s.kill == nil {
-		s.kill = &killCell{}
-	}
 	s.kill.set(kill)
+}
+
+// newKmsgLogSource constructs a kmsgLogSource with its shared killCell already
+// allocated, so the daemon's wireKill -> SetKill (which may run concurrently with
+// a drain's killCell.get) never has to allocate s.kill under no lock. Allocating
+// at construction is the race-safe alternative to a guarded lazy-alloc.
+func newKmsgLogSource(kmsgPath, ncclPath string) *kmsgLogSource {
+	return &kmsgLogSource{
+		KmsgPath: kmsgPath,
+		NCCLPath: ncclPath,
+		kill:     &killCell{},
+	}
 }
 
 // readFile opens path read-only and NON-BLOCKING and drains it through the
@@ -130,7 +145,7 @@ func DefaultCollectors(node string) []Collector {
 			PrometheusCollector{BaseURL: defaultPromURL(), Node: node},
 			&DCGMExporterCollector{ScrapeURL: defaultDCGMURL(), Node: node},
 		),
-		LogEventCollector{Src: &kmsgLogSource{KmsgPath: "/dev/kmsg", NCCLPath: defaultNCCLLog()}, Node: node},
+		LogEventCollector{Src: newKmsgLogSource("/dev/kmsg", defaultNCCLLog()), Node: node},
 	}
 }
 

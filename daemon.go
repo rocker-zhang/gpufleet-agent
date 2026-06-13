@@ -96,14 +96,17 @@ func softCollectErr(err error) bool {
 // error (e.g. ErrProfilingCapped, or any single source failing) does NOT abort
 // the cycle — that source is skipped for this round and the OTHER sources are
 // still normalized and published, so a capped/partial source never drops the
-// whole window. Refresh returns the first soft error seen (so callers can
+// whole window. Refresh returns the first collector error seen (so callers can
 // observe it) only when NO source produced data; otherwise it publishes the
 // partial window and returns nil. A hard Normalize/cost error still leaves the
 // previous State in place.
 func (d *Daemon) Refresh(ctx context.Context) error {
 	now := d.now()
 	obs := make([]Observation, 0, len(d.collectors))
-	var firstSoftErr error
+	// firstCollectErr captures the FIRST per-collector error of ANY kind this
+	// round (soft/capped or otherwise) — every collector error is isolated and
+	// counted; this just remembers the first to surface when no source answered.
+	var firstCollectErr error
 	softErrs := 0
 	for _, c := range d.collectors {
 		if ctx.Err() != nil {
@@ -121,8 +124,8 @@ func (d *Daemon) Refresh(ctx context.Context) error {
 			if softCollectErr(err) {
 				softErrs++
 			}
-			if firstSoftErr == nil {
-				firstSoftErr = err
+			if firstCollectErr == nil {
+				firstCollectErr = err
 			}
 			continue
 		}
@@ -133,8 +136,8 @@ func (d *Daemon) Refresh(ctx context.Context) error {
 	// the previous State (stale-but-valid) and surface the first error so the
 	// caller/loop counts it. We do NOT publish an empty window over a good one.
 	if len(obs) == 0 && len(d.collectors) > 0 {
-		if firstSoftErr != nil {
-			return firstSoftErr
+		if firstCollectErr != nil {
+			return firstCollectErr
 		}
 		return nil
 	}
@@ -149,7 +152,7 @@ func (d *Daemon) Refresh(ctx context.Context) error {
 	// Record partial-collection provenance: some sources failed this round but the
 	// window was still normalized and published from the others (degrade, not
 	// drop). Non-adjudicating metadata only.
-	if firstSoftErr != nil || len(obs) < len(d.collectors) {
+	if firstCollectErr != nil || len(obs) < len(d.collectors) {
 		if win.Pack != nil {
 			if win.Pack.Provenance == nil {
 				win.Pack.Provenance = map[string]string{}
