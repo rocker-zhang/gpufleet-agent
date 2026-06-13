@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"sync"
 	"time"
 
 	gpufleetv1 "github.com/rocker-zhang/gpufleet-proto/gen/go/gpufleet/v1"
@@ -34,9 +35,29 @@ type MetricsChain struct {
 	// but left key fields (peak) missing, merging the fallback's data in. Default
 	// false: fallback is used only when Primary wholly fails/empties.
 	FieldFallback bool
+
+	// selected records the source ACTUALLY chosen by the most recent Collect, so
+	// Source() reflects the real provenance after a fallback (TASK-0033 #2). It is
+	// a pointer so a MetricsChain copied by value into a []Collector still shares
+	// one selection cell; nil ⇒ no Collect has run yet, fall back to the
+	// declared-preference source. Guarded by mu for the concurrent
+	// daemon-loop / API-read split.
+	selected *selectedSource
 }
 
-func (c MetricsChain) Source() gpufleetv1.SignalSource {
+// selectedSource is the shared, mutable cell recording the source a MetricsChain
+// last actually selected. Held by pointer so value-copies of the chain (it is
+// stored in a []Collector by value) observe the same selection.
+type selectedSource struct {
+	mu  sync.RWMutex
+	src gpufleetv1.SignalSource
+	set bool
+}
+
+// declaredSource is the chain's preference order BEFORE any Collect runs: Primary
+// if present, else Fallback, else PROMETHEUS. Source() returns the actually
+// selected source once Collect has run, and this declared default before then.
+func (c MetricsChain) declaredSource() gpufleetv1.SignalSource {
 	if c.Primary != nil {
 		return c.Primary.Source()
 	}
@@ -44,6 +65,45 @@ func (c MetricsChain) Source() gpufleetv1.SignalSource {
 		return c.Fallback.Source()
 	}
 	return gpufleetv1.SignalSource_SIGNAL_SOURCE_PROMETHEUS
+}
+
+// Source reports the source the chain's signals will be tagged with. After a
+// Collect it is the source that ACTUALLY answered (DCGM when Primary fell back),
+// matching the emitted Observation.Source so the >=2-signal independence
+// accounting is judged on the real provenance, not the declared preference
+// (TASK-0033 #2; TASK-0018 independence-by-source). Before the first Collect it
+// is the declared-preference source.
+func (c MetricsChain) Source() gpufleetv1.SignalSource {
+	if c.selected != nil {
+		c.selected.mu.RLock()
+		set, src := c.selected.set, c.selected.src
+		c.selected.mu.RUnlock()
+		if set {
+			return src
+		}
+	}
+	return c.declaredSource()
+}
+
+// recordSelected stores the actually-selected source for Source() to report.
+// Safe to call with a nil receiver cell (no-op when the chain was constructed
+// without the shared cell, e.g. a zero-value literal — Source() then degrades to
+// the declared default, preserving the prior behavior).
+func (c MetricsChain) recordSelected(src gpufleetv1.SignalSource) {
+	if c.selected == nil {
+		return
+	}
+	c.selected.mu.Lock()
+	c.selected.src, c.selected.set = src, true
+	c.selected.mu.Unlock()
+}
+
+// NewMetricsChain builds a MetricsChain whose Source() reflects the actually
+// selected source after a fallback. Prefer this over a struct literal when the
+// chain is wired into a daemon, so Source() and Observation.Source agree even
+// after Primary falls back to Fallback.
+func NewMetricsChain(primary, fallback Collector) MetricsChain {
+	return MetricsChain{Primary: primary, Fallback: fallback, selected: &selectedSource{}}
 }
 
 // Collect runs the degradation chain. It tries Primary; if Primary errors or
@@ -59,6 +119,9 @@ func (c MetricsChain) Collect(now time.Time, window time.Duration) (Observation,
 			if c.FieldFallback && c.Fallback != nil && missingPeak(obs) {
 				obs = c.mergeFallback(obs, now, window)
 			}
+			// Primary answered: the selected source is Primary's, and that is what
+			// Observation.Source already carries.
+			c.recordSelected(c.Primary.Source())
 			markChainProvenance(&obs, "primary", "", c.Primary.Source())
 			return obs, nil
 		}
@@ -70,9 +133,12 @@ func (c MetricsChain) Collect(now time.Time, window time.Duration) (Observation,
 			return Observation{}, primaryErr
 		}
 		// Primary returned no data and there is no fallback: emit the empty
-		// primary observation so the normalizer degrades every field.
-		empty := Observation{Source: c.Source(), Provenance: map[string]string{}}
-		markChainProvenance(&empty, "primary-empty", reasonFor(primaryErr), c.Source())
+		// primary observation so the normalizer degrades every field. The selected
+		// source is the (only) declared source.
+		sel := c.declaredSource()
+		c.recordSelected(sel)
+		empty := Observation{Source: sel, Provenance: map[string]string{}}
+		markChainProvenance(&empty, "primary-empty", reasonFor(primaryErr), sel)
 		return empty, nil
 	}
 
@@ -85,7 +151,12 @@ func (c MetricsChain) Collect(now time.Time, window time.Duration) (Observation,
 		}
 		return Observation{}, ferr
 	}
-	markChainProvenance(&fobs, "fallback", reasonFor(primaryErr), c.Source())
+	// Fallback answered: the ACTUALLY-selected source is the Fallback's. Record it
+	// so Source() reports DCGM (matching fobs.Source), not the declared Prometheus
+	// preference — keeping independence-by-source honest (TASK-0033 #2).
+	fsrc := c.Fallback.Source()
+	c.recordSelected(fsrc)
+	markChainProvenance(&fobs, "fallback", reasonFor(primaryErr), fsrc)
 	return fobs, nil
 }
 

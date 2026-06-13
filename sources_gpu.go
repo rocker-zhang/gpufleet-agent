@@ -3,9 +3,9 @@
 package agent
 
 import (
-	"bytes"
 	"io"
 	"os"
+	"syscall"
 	"time"
 
 	gpufleetv1 "github.com/rocker-zhang/gpufleet-proto/gen/go/gpufleet/v1"
@@ -56,26 +56,56 @@ type kmsgLogSource struct {
 	// NCCLPath is the NCCL log file path (empty ⇒ NCCL stream unavailable).
 	NCCLPath string
 	// MaxBytes caps how much of each stream is read per window (read-only bound).
+	// Zero ⇒ kmsgDefaultMaxBytes.
 	MaxBytes int64
+	// Deadline bounds wall-clock time spent draining each stream. Zero ⇒
+	// kmsgDefaultDeadline. This is the no-stall ceiling for the never-EOF
+	// /dev/kmsg stream (RULES §A; module CLAUDE.md kill-switch rule).
+	Deadline time.Duration
+	// kill is the shared kill-switch holder. The daemon wires its shutdown channel
+	// (ctx.Done()) into this via SetKill, so a shutdown/operator abort interrupts
+	// an in-progress drain at the next chunk boundary and degrades on the partial
+	// bytes. Held BY POINTER so a value-copy of this source (it is stored inside a
+	// LogEventCollector / []Collector by value) still observes the wired channel.
+	// Nil/empty ⇒ no kill-switch (the deadline + byte cap still bound the read).
+	kill *killCell
 }
 
+// SetKill wires the daemon's kill-switch channel into this source so a shutdown /
+// operator abort can interrupt an in-flight /dev/kmsg drain (TASK-0033 #1). It
+// lazily allocates the shared cell so the source need not be constructed with one
+// (kmsgLogSource is value-stored; the pointer cell is what survives the copy). It
+// is the killWirable implementation the daemon discovers via LogEventCollector.
+func (s *kmsgLogSource) SetKill(kill <-chan struct{}) {
+	if s.kill == nil {
+		s.kill = &killCell{}
+	}
+	s.kill.set(kill)
+}
+
+// readFile opens path read-only and NON-BLOCKING and drains it through the
+// build-agnostic boundedReadStream so the collector goroutine can NEVER stall the
+// node, even on /dev/kmsg (a never-EOF stream). The bounded-read LOGIC is shared
+// with the default build and unit-tested there (collectors_kmsg_test.go); here we
+// only supply the real O_RDONLY|O_NONBLOCK handle.
 func (s kmsgLogSource) readFile(path string) (io.Reader, error) {
 	if path == "" {
 		return nil, nil
 	}
-	// O_RDONLY | O_NONBLOCK: /dev/kmsg is a stream; non-blocking read drains the
-	// currently-available buffer without ever writing or blocking the node.
-	f, err := os.OpenFile(path, os.O_RDONLY, 0)
+	// O_RDONLY | O_NONBLOCK: /dev/kmsg is a never-EOF stream; the non-blocking
+	// open is what lets each Read return promptly with whatever is buffered
+	// instead of blocking the OS thread. Read-only: the collector never writes.
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
 	if err != nil {
 		return nil, nil // unavailable ⇒ degrade, never fatal
 	}
 	defer func() { _ = f.Close() }()
-	max := s.MaxBytes
-	if max <= 0 {
-		max = 4 << 20
-	}
-	b, _ := io.ReadAll(io.LimitReader(f, max))
-	return bytes.NewReader(b), nil
+	r, _ := boundedReadToReader(f, boundedReadConfig{
+		MaxBytes: s.MaxBytes,
+		Deadline: s.Deadline,
+		Kill:     s.kill.get(), // nil-safe: no cell / unwired ⇒ nil ⇒ deadline+cap bound
+	})
+	return r, nil
 }
 
 func (s kmsgLogSource) Kmsg() (io.Reader, error) {
@@ -96,11 +126,11 @@ func (s kmsgLogSource) NCCL() (io.Reader, error) {
 // NCCL tail. They are read-only; a source failure is isolated and degrades.
 func DefaultCollectors(node string) []Collector {
 	return []Collector{
-		MetricsChain{
-			Primary:  PrometheusCollector{BaseURL: defaultPromURL(), Node: node},
-			Fallback: &DCGMExporterCollector{ScrapeURL: defaultDCGMURL(), Node: node},
-		},
-		LogEventCollector{Src: kmsgLogSource{KmsgPath: "/dev/kmsg", NCCLPath: defaultNCCLLog()}, Node: node},
+		NewMetricsChain(
+			PrometheusCollector{BaseURL: defaultPromURL(), Node: node},
+			&DCGMExporterCollector{ScrapeURL: defaultDCGMURL(), Node: node},
+		),
+		LogEventCollector{Src: &kmsgLogSource{KmsgPath: "/dev/kmsg", NCCLPath: defaultNCCLLog()}, Node: node},
 	}
 }
 

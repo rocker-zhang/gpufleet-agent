@@ -49,6 +49,18 @@ func (c LogEventCollector) Source() gpufleetv1.SignalSource {
 	return gpufleetv1.SignalSource_SIGNAL_SOURCE_DMESG_XID
 }
 
+// SetKill forwards the daemon's kill-switch channel to the underlying LogSource
+// if that source supports abort-on-demand (e.g. the gpu-build kmsgLogSource that
+// tails the never-EOF /dev/kmsg). Sources that do not implement killWirable (the
+// default-build fixture sources, which read finite text) ignore it — they cannot
+// stall. This is the build-agnostic seam that lets the daemon interrupt an
+// in-flight /dev/kmsg drain on shutdown (TASK-0033 #1).
+func (c LogEventCollector) SetKill(kill <-chan struct{}) {
+	if w, ok := c.Src.(killWirable); ok {
+		w.SetKill(kill)
+	}
+}
+
 // Collect reads and parses the log streams for the window. A stream that is
 // unavailable (nil reader / read error) is skipped and marked in provenance —
 // degrade, never fabricate. It never returns a hard error for an empty/absent
@@ -97,21 +109,38 @@ var xidLineRE = regexp.MustCompile(`Xid\s*\(([^)]*)\)\s*:?\s*(\d+)`)
 var gpuUUIDRE = regexp.MustCompile(`GPU-[0-9a-fA-F-]{8,}`)
 
 // parseKmsgXID parses kernel ring-buffer (dmesg/kmsg) text into XidEvents. Each
-// matched Xid line yields one event carrying the public XID number and the raw
-// line verbatim. Non-Xid lines are ignored. Determinism: events in line order.
+// matched Xid record yields one event carrying the public XID number and the raw
+// record verbatim. Non-Xid records are ignored. Determinism: events in record
+// order.
+//
+// MULTI-LINE CONTINUATION (real /dev/kmsg, TASK-0033 #4): a kmsg record is a
+// header line (`priority,seq,timestamp,flags;message`) optionally followed by
+// CONTINUATION lines that begin with a space or tab (the "extended" key=value
+// metadata, e.g. a DEVICE= line or a wrapped message). The kernel splits a single
+// logical record across these lines. parseKmsgXID folds each continuation line
+// into its header record BEFORE matching, so an Xid number or a GPU UUID that
+// lands on a continuation line is still parsed and the raw record is preserved
+// whole. The default-build FixtureLogSource feeds the same shape, so this is
+// fully testable without /dev/kmsg.
 func parseKmsgXID(r io.Reader, now time.Time) []*gpufleetv1.XidEvent {
 	var events []*gpufleetv1.XidEvent
 	sc := bufio.NewScanner(r)
 	sc.Buffer(make([]byte, 0, 64*1024), 1*1024*1024)
-	for sc.Scan() {
-		raw := sc.Text()
+
+	var rec strings.Builder // the current logical record (header + continuations)
+	have := false
+
+	emit := func(raw string) {
+		if raw == "" {
+			return
+		}
 		m := xidLineRE.FindStringSubmatch(raw)
 		if m == nil {
-			continue
+			return
 		}
 		xid, err := strconv.ParseUint(m[2], 10, 32)
 		if err != nil {
-			continue
+			return
 		}
 		ev := &gpufleetv1.XidEvent{
 			Ts:         timestamppb.New(now),
@@ -124,7 +153,38 @@ func parseKmsgXID(r io.Reader, now time.Time) []*gpufleetv1.XidEvent {
 		}
 		events = append(events, ev)
 	}
+
+	for sc.Scan() {
+		line := sc.Text()
+		if isKmsgContinuation(line) {
+			// Continuation of the current record: append (joined by a space so a
+			// number split across lines still tokenizes and the regex can match).
+			if have {
+				rec.WriteByte(' ')
+				rec.WriteString(strings.TrimSpace(line))
+			}
+			continue
+		}
+		// A new header line: flush the previous record, then start this one.
+		if have {
+			emit(rec.String())
+		}
+		rec.Reset()
+		rec.WriteString(line)
+		have = true
+	}
+	if have {
+		emit(rec.String())
+	}
 	return events
+}
+
+// isKmsgContinuation reports whether a kmsg line is a CONTINUATION of the
+// preceding record. Per the kernel /dev/kmsg format, continuation/metadata lines
+// begin with a space or tab; a header line never does (it begins with the numeric
+// priority field). An empty line is not a continuation.
+func isKmsgContinuation(line string) bool {
+	return len(line) > 0 && (line[0] == ' ' || line[0] == '\t')
 }
 
 // kmsgSeverity extracts a coarse, opaque severity hint from a kmsg line. Best
