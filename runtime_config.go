@@ -5,6 +5,8 @@ import (
 	"io"
 	"os"
 	"time"
+
+	gpufleetv1 "github.com/rocker-zhang/gpufleet-proto/gen/go/gpufleet/v1"
 )
 
 // This file is the build-AGNOSTIC runtime endpoint wiring (TASK-0037): it turns
@@ -58,8 +60,23 @@ type RuntimeConfig struct {
 
 	// Queries overrides the PromQL expressions read from Prometheus. Zero value
 	// uses DefaultPromQueries (the common DCGM-exporter labeling). Only consulted
-	// when PrometheusURL is set.
+	// when PrometheusURL is set. An operator aligns these to the real
+	// dcgm-exporter schema discovered in recon WITHOUT rebuilding (TASK-0038).
 	Queries PromQueries
+	// Labels overrides the Prometheus identity label keys (UUID/Hostname/model/job).
+	// Zero value uses the common DCGM-exporter labeling (PromLabels.withDefaults).
+	// Only consulted when PrometheusURL is set. Lets an operator align to a
+	// non-default dcgm-exporter relabeling without rebuilding (TASK-0038).
+	Labels PromLabels
+
+	// Spec is the operator's STATIC device-spec (TASK-0038): per-GPU-model or
+	// per-UUID {peak_tflops, cost_usd_per_hour}. When the real Prom/DCGM path
+	// supplies no peak/cost, the spec fills PeakFLOPS/CostPerHour so MFU + $/hr
+	// render real, stamped with provenance (peak.source/cost.source=static-spec).
+	// A real series ALWAYS wins over the spec; an empty spec is a transparent
+	// passthrough (no-spec behavior unchanged). Applied to BOTH the real chain and
+	// the mock default, so a spec completes whichever metrics source is active.
+	Spec DeviceSpec
 
 	// NCCLLogPath, when set, points the log/event collector at an NCCL log file
 	// (read-only tail). Empty ⇒ NCCL stream unavailable (degrade). dmesg/kmsg is
@@ -117,7 +134,12 @@ func (c RuntimeConfig) useReal() bool {
 // existing chain. The chosen mode is reported for provenance/logging.
 func (c RuntimeConfig) Collectors() (cols []Collector, mode CollectorMode) {
 	if !c.useReal() {
-		return DefaultCollectors(c.Node), CollectorModeMock
+		mock := DefaultCollectors(c.Node)
+		// An operator may pair a static spec with the mock default (e.g. a homogeneous
+		// box demo): the spec then completes any peak/cost the mock left unknown,
+		// stamped static-spec. With NO spec this is a transparent passthrough, so the
+		// no-endpoint mock default stays byte-for-byte backward compatible (demo1).
+		return c.applySpec(mock), CollectorModeMock
 	}
 
 	queries := c.Queries
@@ -126,13 +148,15 @@ func (c RuntimeConfig) Collectors() (cols []Collector, mode CollectorMode) {
 	}
 
 	// Primary: existing Prometheus (preferred, zero new scrape load). nil when no
-	// URL given, so the chain has only the DCGM fallback.
+	// URL given, so the chain has only the DCGM fallback. Labels align to the real
+	// dcgm-exporter schema discovered in recon (zero value ⇒ common defaults).
 	var primary Collector
 	if c.PrometheusURL != "" {
 		primary = PrometheusCollector{
 			BaseURL: c.PrometheusURL,
 			Node:    c.Node,
 			Queries: queries,
+			Labels:  c.Labels,
 		}
 	}
 
@@ -157,11 +181,40 @@ func (c RuntimeConfig) Collectors() (cols []Collector, mode CollectorMode) {
 		logSrc = fileNCCLSource{path: c.NCCLLogPath}
 	}
 
+	// Wrap the metrics chain with the static-spec fill (TASK-0038): when the real
+	// chain leaves peak/cost unknown, the operator's spec completes it (real wins;
+	// empty spec ⇒ passthrough), stamped static-spec for auditability.
+	var metrics Collector = NewMetricsChain(primary, fallback)
+	if !c.Spec.Empty() {
+		metrics = SpecFillCollector{Inner: metrics, Spec: c.Spec}
+	}
 	cols = []Collector{
-		NewMetricsChain(primary, fallback),
+		metrics,
 		LogEventCollector{Src: logSrc, Node: c.Node},
 	}
 	return cols, CollectorModeReal
+}
+
+// applySpec wraps each metrics collector in `cols` with SpecFillCollector when a
+// non-empty static spec is configured, leaving non-metrics collectors (log/event)
+// untouched. With an empty spec it returns `cols` unchanged — a transparent
+// passthrough preserving exact backward compatibility (the mock default path).
+// A metrics collector is identified by its SignalSource (Prometheus or DCGM).
+func (c RuntimeConfig) applySpec(cols []Collector) []Collector {
+	if c.Spec.Empty() {
+		return cols
+	}
+	out := make([]Collector, len(cols))
+	for i, col := range cols {
+		switch col.Source() {
+		case gpufleetv1.SignalSource_SIGNAL_SOURCE_PROMETHEUS,
+			gpufleetv1.SignalSource_SIGNAL_SOURCE_DCGM:
+			out[i] = SpecFillCollector{Inner: col, Spec: c.Spec}
+		default:
+			out[i] = col
+		}
+	}
+	return out
 }
 
 // fileNCCLSource is a read-only LogSource that tails an NCCL log FILE on the

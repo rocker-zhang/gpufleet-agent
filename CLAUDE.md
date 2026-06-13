@@ -148,6 +148,93 @@ DCGM-exporter labeling (`DefaultPromQueries`); override via the package
 `RuntimeConfig.Queries` if your labels differ. Everything here is **read-only**
 config + read endpoints — zero write-back.
 
+## 5c. 静态 device-spec + 查询/标签覆盖 (static spec + override — TASK-0038)
+
+On a **vanilla** dcgm-exporter + Prometheus box the cost-rate series
+(`gpufleet_device_cost_usd_per_hour`) and the tensor-peak field
+(`DCGM_FI_DEV_TENSOR_PEAK_FLOPS`) **do not exist**, so `$/hr` and **MFU silently
+degrade to 0**. `$/hr` is inherently an operator **price** input; peak-FLOPS for a
+known GPU model is a **static spec**. Supply them as a static device-spec so MFU +
+`$/hr` render real — without rebuilding.
+
+```sh
+# A10 box: real DCGM tensor-active, no peak/cost series → fill from a spec file.
+agent -serve \
+  --dcgm-exporter-url  http://127.0.0.1:9400/metrics \
+  --device-spec-file   /etc/gpufleet/device-spec.json \
+  --node $NODE_NAME
+
+# Homogeneous box shortcut (no JSON): one peak + one rate for every device.
+agent -serve --dcgm-exporter-url http://127.0.0.1:9400/metrics \
+  --peak-tflops 125 --cost-usd-per-hour 1.20 --node $NODE_NAME
+```
+
+Example `device-spec.json` (per-GPU-model; see `testdata/device-spec-a10.json`):
+
+```json
+{ "NVIDIA A10": { "peak_tflops": 125, "cost_usd_per_hour": 1.20 } }
+```
+
+Per-UUID pinning (wins over model) uses the explicit shape; both may coexist:
+
+```json
+{
+  "by_uuid":  { "GPU-abc123": { "peak_tflops": 312, "cost_usd_per_hour": 4.10 } },
+  "by_model": { "NVIDIA A10": { "peak_tflops": 125, "cost_usd_per_hour": 1.20 } }
+}
+```
+
+Model matching is **case-insensitive** and tolerant of a leading `NVIDIA ` prefix
+(`A10` ≡ `NVIDIA A10`). Match order: UUID → named model → `*` wildcard (the quick
+shortcut). A zero/omitted field fills nothing and keeps degrading.
+
+**Semantics (RULES §B):** the spec is an **explicit operator input**, so using it
+is not fabrication — but every spec-sourced value is **stamped** in pack provenance
+so the origin stays auditable:
+
+| provenance key | meaning |
+|----------------|---------|
+| `<src>.spec.peak.source = static-spec` | a peak was filled from the spec |
+| `<src>.spec.cost.source = static-spec` | a `$/hr` rate was filled from the spec |
+| `<src>.spec.achieved_flops.source = derived:tensor-active*static-spec-peak` | achieved-FLOPs was derived from the **real** tensor-active series × the spec peak (the same identity as the default PromQL) |
+| `<src>.spec.filled_devices = <uuid,...>` | which devices the spec touched |
+
+A **real series ALWAYS wins** over the spec (the spec only fills a gap a real
+source left). With **no spec AND no real series** the field still **degrades**
+(`mfu`/`cost` degrade-marks), never invented. An **empty spec is a transparent
+passthrough** — the no-spec mock/real path is byte-for-byte unchanged.
+
+### Query / label override
+
+Align to a non-default dcgm-exporter schema discovered in recon **without
+rebuilding** — override the PromQL expressions and/or the identity label keys.
+Each flag has an env equivalent; an unset query field falls back to its
+`DefaultPromQueries` value (override one, keep the rest), an unset label key
+falls back to the common DCGM-exporter default.
+
+| flag | env | meaning (default) |
+|------|-----|-------------------|
+| `--device-spec-file` | `GPUFLEET_DEVICE_SPEC_FILE` | static device-spec JSON (per-model or per-UUID). |
+| `--peak-tflops` | `GPUFLEET_PEAK_TFLOPS` | homogeneous-box peak TFLOP/s (wildcard `*` entry). |
+| `--cost-usd-per-hour` | `GPUFLEET_COST_USD_PER_HOUR` | homogeneous-box `$/hour` (wildcard `*` entry). |
+| `--query-tensor-active` | `GPUFLEET_QUERY_TENSOR_ACTIVE` | PromQL for tensor-active (`DCGM_FI_PROF_PIPE_TENSOR_ACTIVE`). |
+| `--query-achieved-flops` | `GPUFLEET_QUERY_ACHIEVED_FLOPS` | PromQL for achieved FLOP/s (`…TENSOR_ACTIVE * …TENSOR_PEAK_FLOPS`). |
+| `--query-peak-flops` | `GPUFLEET_QUERY_PEAK_FLOPS` | PromQL for peak FLOP/s (`DCGM_FI_DEV_TENSOR_PEAK_FLOPS`). |
+| `--query-cost-per-hour` | `GPUFLEET_QUERY_COST_PER_HOUR` | PromQL for `$/hour` (`gpufleet_device_cost_usd_per_hour`). |
+| `--query-job-owner` | `GPUFLEET_QUERY_JOB_OWNER` | PromQL for device→job (`gpufleet_device_job`). |
+| `--label-uuid` | `GPUFLEET_LABEL_UUID` | device-UUID label key (`UUID`). |
+| `--label-node` | `GPUFLEET_LABEL_NODE` | hostname label key (`Hostname`). |
+| `--label-model` | `GPUFLEET_LABEL_MODEL` | model label key (`modelName`). |
+| `--label-job` | `GPUFLEET_LABEL_JOB` | job label key (`job`). |
+
+```sh
+# Example: a box whose UUID label is `gpu` and whose cost series has a custom name.
+agent -serve --prometheus-url http://prometheus:9090 \
+  --label-uuid gpu \
+  --query-cost-per-hour 'my_org_gpu_price_usd_hour' \
+  --device-spec-file /etc/gpufleet/device-spec.json
+```
+
 ## 6. session 工作规则
 - Edits **confined to this repo** (`agent/`). `proto/` read-only.
 - Need a change in `semantics`, `rca`, `cli`, `proto`, or the controlplane? **ABSTAIN and file a short blocker** (what you needed, which module/contract). No cross-repo workarounds.

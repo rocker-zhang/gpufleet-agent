@@ -50,7 +50,45 @@ func main() {
 		"opt into high-resolution DCGM profiling scrapes, frequency-capped by --profiling-cap; env GPUFLEET_PROFILING_BURST")
 	profilingCap := flag.Duration("profiling-cap", envDur("GPUFLEET_PROFILING_CAP", agent.DefaultProfilingBurstInterval),
 		"minimum interval between profiling-burst scrapes (off-critical-path cap); env GPUFLEET_PROFILING_CAP")
+
+	// TASK-0038 — static device-spec ($/hr is an operator PRICE input; peak-FLOPS
+	// for a known GPU model is a static spec). When the real Prom/DCGM path gives
+	// no peak/cost, fill from the spec so MFU + $/hr render real, stamped
+	// static-spec for auditability. A real series always wins over the spec.
+	deviceSpecFile := flag.String("device-spec-file", envStr("GPUFLEET_DEVICE_SPEC_FILE", ""),
+		"static device-spec JSON: per-GPU-model or per-UUID {peak_tflops, cost_usd_per_hour} filling missing peak/cost; env GPUFLEET_DEVICE_SPEC_FILE")
+	costPerHour := flag.Float64("cost-usd-per-hour", envFloat("GPUFLEET_COST_USD_PER_HOUR", 0),
+		"homogeneous-box $/hour rate applied to every device missing a cost (quick alternative to a spec file); env GPUFLEET_COST_USD_PER_HOUR")
+	peakTFLOPS := flag.Float64("peak-tflops", envFloat("GPUFLEET_PEAK_TFLOPS", 0),
+		"homogeneous-box peak TFLOP/s applied to every device missing a peak (quick alternative to a spec file); env GPUFLEET_PEAK_TFLOPS")
+
+	// TASK-0038 — query/label override so an operator aligns to the real
+	// dcgm-exporter schema discovered in recon WITHOUT rebuilding.
+	qTensorActive := flag.String("query-tensor-active", envStr("GPUFLEET_QUERY_TENSOR_ACTIVE", ""),
+		"override PromQL for tensor-active; env GPUFLEET_QUERY_TENSOR_ACTIVE")
+	qAchievedFLOPs := flag.String("query-achieved-flops", envStr("GPUFLEET_QUERY_ACHIEVED_FLOPS", ""),
+		"override PromQL for achieved FLOP/s; env GPUFLEET_QUERY_ACHIEVED_FLOPS")
+	qPeakFLOPS := flag.String("query-peak-flops", envStr("GPUFLEET_QUERY_PEAK_FLOPS", ""),
+		"override PromQL for peak FLOP/s; env GPUFLEET_QUERY_PEAK_FLOPS")
+	qCostPerHour := flag.String("query-cost-per-hour", envStr("GPUFLEET_QUERY_COST_PER_HOUR", ""),
+		"override PromQL for $/hour rate; env GPUFLEET_QUERY_COST_PER_HOUR")
+	qJobOwner := flag.String("query-job-owner", envStr("GPUFLEET_QUERY_JOB_OWNER", ""),
+		"override PromQL for device->job ownership; env GPUFLEET_QUERY_JOB_OWNER")
+	labelUUID := flag.String("label-uuid", envStr("GPUFLEET_LABEL_UUID", ""),
+		"override the Prometheus device-UUID label key (default UUID); env GPUFLEET_LABEL_UUID")
+	labelNode := flag.String("label-node", envStr("GPUFLEET_LABEL_NODE", ""),
+		"override the Prometheus hostname label key (default Hostname); env GPUFLEET_LABEL_NODE")
+	labelModel := flag.String("label-model", envStr("GPUFLEET_LABEL_MODEL", ""),
+		"override the Prometheus model label key (default modelName); env GPUFLEET_LABEL_MODEL")
+	labelJob := flag.String("label-job", envStr("GPUFLEET_LABEL_JOB", ""),
+		"override the Prometheus job label key (default job); env GPUFLEET_LABEL_JOB")
 	flag.Parse()
+
+	spec, err := buildDeviceSpec(*deviceSpecFile, *peakTFLOPS, *costPerHour)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "agent: device-spec: %v\n", err)
+		os.Exit(1)
+	}
 
 	rc := agent.RuntimeConfig{
 		Node:            *node,
@@ -60,6 +98,20 @@ func main() {
 		NCCLLogPath:     *ncclLog,
 		ProfilingBurst:  *profilingBurst,
 		ProfilingCap:    *profilingCap,
+		Queries: overrideQueries(agent.PromQueries{
+			TensorActive:  *qTensorActive,
+			AchievedFLOPs: *qAchievedFLOPs,
+			PeakFLOPS:     *qPeakFLOPS,
+			CostPerHour:   *qCostPerHour,
+			JobOwner:      *qJobOwner,
+		}),
+		Labels: agent.PromLabels{
+			UUID:  *labelUUID,
+			Node:  *labelNode,
+			Model: *labelModel,
+			Job:   *labelJob,
+		},
+		Spec: spec,
 	}
 	cols, mode := rc.Collectors()
 	fmt.Fprintf(os.Stderr, "agent: collectors=%s (prometheus-url=%q dcgm-exporter-url=%q)\n",
@@ -147,6 +199,68 @@ func envDur(key string, def time.Duration) time.Duration {
 		return dur
 	}
 	return def
+}
+
+// envFloat parses a float64 env var, falling back to `def` when unset or
+// unparseable. Used for the homogeneous-box --cost-usd-per-hour / --peak-tflops
+// quick spec shortcuts.
+func envFloat(key string, def float64) float64 {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	if f, err := strconv.ParseFloat(v, 64); err == nil {
+		return f
+	}
+	return def
+}
+
+// buildDeviceSpec assembles the static device-spec (TASK-0038) from the spec
+// file (if any) plus the homogeneous-box quick shortcuts. The file is loaded
+// first; the quick --peak-tflops/--cost-usd-per-hour then seed a wildcard
+// fallback entry applied to ANY device the file does not name, so a homogeneous
+// box needs no per-model JSON. A real series still always wins over either.
+func buildDeviceSpec(file string, peakTFLOPS, costPerHour float64) (agent.DeviceSpec, error) {
+	spec, err := agent.LoadDeviceSpec(file)
+	if err != nil {
+		return agent.DeviceSpec{}, err
+	}
+	if peakTFLOPS > 0 || costPerHour > 0 {
+		if spec.ByModel == nil {
+			spec.ByModel = map[string]agent.DeviceSpecEntry{}
+		}
+		// The wildcard model "*" matches any device the spec did not name (a
+		// homogeneous-box convenience). lookup() consults named entries first.
+		spec.ByModel[agent.WildcardModel] = agent.DeviceSpecEntry{
+			PeakTFLOPS:  peakTFLOPS,
+			CostPerHour: costPerHour,
+		}
+	}
+	return spec, nil
+}
+
+// overrideQueries fills any query field the operator left empty with the
+// DefaultPromQueries value, so an operator can override ONE expression (e.g.
+// align CostPerHour to a real series name) without blanking the rest. An
+// all-empty input ⇒ the full defaults.
+func overrideQueries(q agent.PromQueries) agent.PromQueries {
+	def := agent.DefaultPromQueries()
+	if q.TensorActive == "" {
+		q.TensorActive = def.TensorActive
+	}
+	if q.AchievedFLOPs == "" {
+		q.AchievedFLOPs = def.AchievedFLOPs
+	}
+	if q.PeakFLOPS == "" {
+		q.PeakFLOPS = def.PeakFLOPS
+	}
+	if q.CostPerHour == "" {
+		q.CostPerHour = def.CostPerHour
+	}
+	if q.JobOwner == "" {
+		q.JobOwner = def.JobOwner
+	}
+	return q
 }
 
 func mustProtoJSON(st *agent.State) []byte {
