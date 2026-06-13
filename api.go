@@ -58,19 +58,43 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 }
 
 // HealthResponse is the /healthz payload.
+//
+// LastSuccessAt / AgeSeconds / Stale / StaleReason reflect the agent-side data
+// freshness (TASK-0040): last_success_at is the last SUCCESSFUL collection (==
+// refresh_at of the live window), age_seconds is how long ago that was, and
+// stale=true means the agent is still serving that last-known window but it is
+// older than the staleness threshold (so a consumer must NOT treat it as live).
+// OK stays true even when stale — the agent process is healthy and off-path; a
+// stale data window is a data-freshness signal, not a liveness failure.
 type HealthResponse struct {
-	OK        bool      `json:"ok"`
-	Refreshes uint64    `json:"refreshes"`
-	Errors    uint64    `json:"errors"`
-	RefreshAt time.Time `json:"refresh_at,omitempty"`
+	OK             bool      `json:"ok"`
+	Refreshes      uint64    `json:"refreshes"`
+	Errors         uint64    `json:"errors"`
+	RefreshAt      time.Time `json:"refresh_at,omitempty"`
+	LastSuccessAt  time.Time `json:"last_success_at,omitempty"`
+	AgeSeconds     float64   `json:"age_seconds"`
+	Stale          bool      `json:"stale"`
+	StaleReason    string    `json:"stale_reason,omitempty"`
+	ConsecFailures uint64    `json:"consec_failures"`
 }
 
 func (a *API) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	st := a.d.Snapshot()
-	resp := HealthResponse{OK: true, Errors: a.d.Errs()}
+	fr := a.d.Freshness()
+	resp := HealthResponse{
+		OK:             true,
+		Errors:         a.d.Errs(),
+		Stale:          fr.Stale,
+		StaleReason:    fr.Reason,
+		ConsecFailures: fr.ConsecFails,
+	}
 	if st != nil {
 		resp.Refreshes = st.Refreshes
 		resp.RefreshAt = st.RefreshAt
+	}
+	if fr.HasData {
+		resp.LastSuccessAt = fr.CollectedAt
+		resp.AgeSeconds = fr.Age.Seconds()
 	}
 	writeJSON(w, http.StatusOK, resp)
 }
@@ -128,9 +152,23 @@ type JobCost struct {
 }
 
 // CostResponse is the /cost payload.
+//
+// CollectedAt / AgeSeconds / Stale / StaleReason are the data-freshness fields
+// (TASK-0040), reported at the TOP level (not per-device) because freshness is a
+// property of the whole window, not of one device. collected_at is the
+// last-SUCCESSFUL collection time, age_seconds is how old that is at read time,
+// and stale=true means the device/job values BELOW are the last-known window
+// held past the staleness threshold — they are kept (never blanked, never
+// fabricated) but MUST be presented as stale, not current (RULES §B). When fresh,
+// stale=false and stale_reason is empty; the device/job fields are unchanged from
+// before this task (backward compatible — the per-device DTOs did not change).
 type CostResponse struct {
-	Devices []DeviceCost `json:"devices"`
-	Jobs    []JobCost    `json:"jobs"`
+	Devices     []DeviceCost `json:"devices"`
+	Jobs        []JobCost    `json:"jobs"`
+	CollectedAt time.Time    `json:"collected_at,omitempty"`
+	AgeSeconds  float64      `json:"age_seconds"`
+	Stale       bool         `json:"stale"`
+	StaleReason string       `json:"stale_reason,omitempty"`
 }
 
 func costResponse(st *State) CostResponse {
@@ -161,13 +199,29 @@ func costResponse(st *State) CostResponse {
 	return resp
 }
 
+// stampFreshness copies the daemon's current freshness verdict onto a
+// CostResponse (TASK-0040). Centralized so /cost and /window report the same
+// data-age + stale fields and never present a held-stale window as current.
+func stampFreshness(resp CostResponse, fr Freshness) CostResponse {
+	resp.Stale = fr.Stale
+	resp.StaleReason = fr.Reason
+	if fr.HasData {
+		resp.CollectedAt = fr.CollectedAt
+		resp.AgeSeconds = fr.Age.Seconds()
+	}
+	return resp
+}
+
 func (a *API) handleCost(w http.ResponseWriter, _ *http.Request) {
-	st := a.d.Snapshot()
+	// Serve the last COST-bearing window (TASK-0040): if the exporter is currently
+	// unreachable, this is the last-known device data — retained, never blanked —
+	// and stampFreshness flags it stale so the reader never treats it as live.
+	st := a.d.CostSnapshot()
 	if st == nil {
 		http.Error(w, "no signal window collected yet", http.StatusServiceUnavailable)
 		return
 	}
-	writeJSON(w, http.StatusOK, costResponse(st))
+	writeJSON(w, http.StatusOK, stampFreshness(costResponse(st), a.d.Freshness()))
 }
 
 // WindowResponse is the /window combined read-only view.
@@ -191,6 +245,13 @@ func (a *API) handleWindow(w http.ResponseWriter, _ *http.Request) {
 	for _, s := range st.Window.Sources {
 		srcs = append(srcs, sourceShort(s))
 	}
+	// Window meta comes from the freshest window; the Cost block comes from the
+	// last COST-bearing window (TASK-0040) + the freshness verdict, so a
+	// metrics-less cycle never blanks the cost view nor presents it as live.
+	costSt := a.d.CostSnapshot()
+	if costSt == nil {
+		costSt = st
+	}
 	resp := WindowResponse{
 		ContractVersion: st.Window.Pack.ContractVersion,
 		AgentID:         st.Window.Pack.AgentId,
@@ -198,7 +259,7 @@ func (a *API) handleWindow(w http.ResponseWriter, _ *http.Request) {
 		WindowEnd:       st.Window.WindowEnd,
 		Sources:         srcs,
 		Degraded:        st.Window.Degraded,
-		Cost:            costResponse(st),
+		Cost:            stampFreshness(costResponse(costSt), a.d.Freshness()),
 	}
 	writeJSON(w, http.StatusOK, resp)
 }

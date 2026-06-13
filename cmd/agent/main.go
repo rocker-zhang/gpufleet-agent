@@ -33,6 +33,12 @@ func main() {
 	addr := flag.String("addr", "127.0.0.1:0", "localhost address for the read-only API (with -serve)")
 	window := flag.Duration("window", 60*time.Second, "collection window duration")
 	interval := flag.Duration("interval", 15*time.Second, "headless refresh interval (with -serve)")
+	// TASK-0040 — data-freshness/staleness. Age (since the last SUCCESSFUL
+	// collection) beyond which /cost + /healthz report stale=true while still
+	// serving the last-known window (never blanked/fabricated). 0 ⇒ derive a safe
+	// default of max(3×interval, 5s) so it tracks the refresh cadence.
+	stalenessAfter := flag.Duration("staleness-after", envDur("GPUFLEET_STALENESS_AFTER", 0),
+		"age since last SUCCESSFUL collection beyond which data is marked stale; 0 = max(3×interval, 5s); env GPUFLEET_STALENESS_AFTER")
 
 	// TASK-0037 — runtime endpoint wiring. Point the agent at REAL telemetry.
 	// HTTP scrape only (no NVML): the real Prometheus/DCGM collectors compile in
@@ -117,11 +123,23 @@ func main() {
 	fmt.Fprintf(os.Stderr, "agent: collectors=%s (prometheus-url=%q dcgm-exporter-url=%q)\n",
 		mode, *promURL, *dcgmURL)
 
+	// Resolve the staleness threshold (TASK-0040). When the flag/env is unset (0),
+	// derive max(3×interval, 5s) from the refresh cadence — three missed
+	// collections, floored so a fast interval does not flap to stale on jitter.
+	staleAfter := *stalenessAfter
+	if staleAfter <= 0 {
+		staleAfter = 3 * *interval
+		if floor := 5 * time.Second; staleAfter < floor {
+			staleAfter = floor
+		}
+	}
+
 	d := agent.NewDaemon(agent.DaemonConfig{
-		AgentID:    "gpufleet-agent",
-		Window:     *window,
-		Collectors: cols,
-		Policy:     agent.DefaultCostPolicy(),
+		AgentID:        "gpufleet-agent",
+		Window:         *window,
+		StalenessAfter: staleAfter,
+		Collectors:     cols,
+		Policy:         agent.DefaultCostPolicy(),
 	})
 
 	if !*serve {
@@ -152,7 +170,7 @@ func main() {
 	go func() { _ = d.Run(ctx, *interval) }()
 
 	srv := &http.Server{Addr: *addr, Handler: agent.NewAPI(d).Handler()}
-	fmt.Fprintf(os.Stderr, "agent: local read-only API listening on %s (GET /signals /cost /window /healthz)\n", *addr)
+	fmt.Fprintf(os.Stderr, "agent: local read-only API listening on %s (GET /signals /cost /window /healthz); staleness-after=%s\n", *addr, staleAfter)
 	go func() {
 		<-ctx.Done()
 		shutCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)

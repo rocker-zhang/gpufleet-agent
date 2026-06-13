@@ -235,6 +235,66 @@ agent -serve --prometheus-url http://prometheus:9090 \
   --device-spec-file /etc/gpufleet/device-spec.json
 ```
 
+## 5d. 数据新鲜度 / staleness (data freshness — TASK-0040)
+
+A read-only monitor must **never present stale data as current**. There are TWO
+distinct latencies; the agent handles them differently:
+
+- **(a) DCGM profiling sample window (~25–30s) — UPSTREAM, NOT measured here.**
+  DCGM's profiling fields (`PIPE_TENSOR_ACTIVE`, `SM_ACTIVE`, `DRAM_ACTIVE`) are
+  themselves averaged over DCGM's own ~25–30s collection cycle. That latency is a
+  property of the exporter, **upstream of the agent** — the agent reads the value
+  the exporter publishes and **cannot observe** how old that internal sample is.
+  We only **document** it: even a perfectly fresh scrape carries a number that is
+  up to ~25–30s averaged. This is NOT what `stale` below measures.
+- **(b) Agent-side freshness — MEASURED here.** How long since the agent last
+  **SUCCESSFULLY** scraped its source. The agent owns this clock, so it reports
+  it. If the exporter goes unreachable / collection keeps failing, the daemon
+  keeps serving the **last-known** window (never blanked, never fabricated —
+  RULES §A) but marks it `stale=true` once its age passes the threshold, so a
+  consumer presents it as stale, not live (RULES §B).
+
+**Threshold.** Configurable via `--staleness-after` / `GPUFLEET_STALENESS_AFTER`.
+Unset (`0`) derives `max(3×interval, 5s)` — three missed collections, floored so
+a fast interval does not flap to stale on normal jitter.
+
+**Mechanics.** The daemon publishes a new `State` only on a *successful*
+collection, so `RefreshAt` is the last-successful-collection time. A failed cycle
+(every source erred, or a hard Normalize/cost error) bumps a consecutive-failure
+streak and a reason, **leaves the prior State in place**, and never advances the
+refresh counter. `age = now − collected_at`; `stale = age > staleness-after`. A
+later success resets the streak/reason and serves live again. A *partial*
+collection that still publishes a window is **fresh** (not stale) — only a
+full-cycle failure ages the data.
+
+**Where it surfaces (untyped JSON only).** `/cost` and `/healthz` are the agent's
+own untyped JSON (NOT proto — §5a), so freshness is added there in-scope:
+
+`GET /cost` gains top-level fields (the per-device `DeviceCost`/`JobCost` shapes
+are **unchanged**, so the §5a golden still decodes):
+
+| field          | type   | meaning |
+|----------------|--------|---------|
+| `collected_at` | string | RFC3339 time of the last SUCCESSFUL collection |
+| `age_seconds`  | float  | `now − collected_at`, seconds |
+| `stale`        | bool   | `age_seconds` exceeded `--staleness-after` |
+| `stale_reason` | string | provenance when stale (e.g. "N consecutive collection failure(s): …"); empty when fresh |
+
+`GET /healthz` reflects `last_success_at`, `age_seconds`, `stale`,
+`stale_reason`, `consec_failures`. `ok` stays **true** even when stale — the
+agent process is healthy and off-path; staleness is a *data*-freshness signal,
+not a liveness failure.
+
+**Proto note (§D, ABSTAIN).** Freshness is exposed on the agent's untyped `/cost`
++ `/healthz` only. Putting it into the proto-typed `/signals` EvidencePack would
+require a `proto/` contract change — **out of scope; ABSTAIN** (orchestrator
+decision). `/signals` is left untouched.
+
+The `cli` viewer renders a `data age: Ns` line and, on `stale`, a prominent
+`*** STALE ***` marker + the agent's reason + a "do not treat as current" note,
+while still showing the last-known values. cli passes the agent's verdict through
+verbatim (it does not recompute the threshold) and stays a read-only HTTP viewer.
+
 ## 6. session 工作规则
 - Edits **confined to this repo** (`agent/`). `proto/` read-only.
 - Need a change in `semantics`, `rca`, `cli`, `proto`, or the controlplane? **ABSTAIN and file a short blocker** (what you needed, which module/contract). No cross-repo workarounds.
