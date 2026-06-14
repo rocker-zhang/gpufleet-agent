@@ -235,6 +235,99 @@ agent -serve --prometheus-url http://prometheus:9090 \
   --device-spec-file /etc/gpufleet/device-spec.json
 ```
 
+## 5e. 内置 GPU 峰值查表 (built-in peak-FLOPS table — TASK-0044)
+
+On a **vanilla** dcgm-exporter box the tensor-peak field
+(`DCGM_FI_DEV_TENSOR_PEAK_FLOPS`) **does not exist**, so MFU silently degrades and
+the operator must hand-supply `--peak-tflops 125`. But the peak FLOPs of a known
+datacenter GPU is a **published per-(model × precision) datasheet constant**, and
+the agent already sees the DCGM `modelName` label (e.g. `"NVIDIA A10"`). So it can
+**auto-resolve** the peak from the model name — **zero-config real MFU**:
+
+```sh
+# A10 box, NO --peak-tflops: the built-in table fills peak=125 from modelName.
+agent -serve --dcgm-exporter-url http://127.0.0.1:9400/metrics --node $NODE_NAME
+```
+
+### Strict precedence (RULES §B — degrade-not-fabricate)
+
+```
+real telemetry peak (DCGM/Prom series, if present)
+  > operator-explicit --peak-tflops / --device-spec-file
+  > built-in table (by modelName)
+  > DEGRADE (peak stays unknown, MFU degrades, never fabricated)
+```
+
+The table is the **LAST resort before degrade**: `PeakTableCollector` wraps the
+chain **outside** `SpecFillCollector`, so it only fills a peak that neither a real
+series nor an explicit operator spec supplied. An **unknown model DEGRADES** (the
+peak stays unknown and is marked) — it is **never guessed**.
+
+### Precision basis (honesty)
+
+Every entry is the **NVIDIA datasheet FP16/BF16 DENSE tensor** peak — **NOT** the
+2× sparse number, NOT FP8/FP4, NOT FP32/FP64. This single, documented basis
+matches how the cost wedge computes MFU (achieved tensor FLOPs ÷ peak). The basis
+is stamped into provenance so a reviewer can audit both the origin AND the
+precision assumption.
+
+### Coverage (FP16/BF16 dense tensor TFLOP/s; source: NVIDIA datasheets)
+
+| modelName (matched) | canonical | TFLOP/s |
+|---|---|---|
+| A10 | A10 | 125 |
+| A100 (40GB / 80GB, any SKU) | A100-40GB / A100-80GB | 312 |
+| H100 SXM / H100 PCIe / H100 NVL | H100-SXM / H100-PCIe / H100-NVL | 989.4 / 756 / 835 |
+| H200 | H200 | 989.4 |
+| GH200 (Grace-Hopper, shares H100 GH100 die) | GH200 | 989.4 |
+| L4 / L40 / L40S | L4 / L40 / L40S | 121 / 181 / 362 |
+| V100 (FP16) | V100 | 125 |
+| T4 (FP16) | T4 | 65 |
+| RTX A6000 | A6000 | 155 |
+| B200 | B200 | 2250 |
+
+**GB10 / DGX Spark is DELIBERATELY ABSENT.** The widely-quoted "1 petaFLOP" GB10
+figure is the **FP4-with-sparsity** marketing number — not FP16/BF16 dense — so
+adding it would break this table's basis. NVIDIA publishes no confident
+FP16/BF16-dense per-GPU datasheet figure for GB10, so per RULES §B
+(degrade-not-fabricate) a GB10 box matches **nothing** → peak degrades → the
+operator supplies `--peak-tflops`. An entry is added only once a real
+FP16/BF16-dense datasheet number is published.
+
+Model matching is **case-insensitive** and tolerant of a leading `NVIDIA `/`Tesla
+`/`RTX ` vendor prefix and of **SKU suffixes** (`A100-SXM4-80GB` → `A100-80GB`,
+`Tesla T4` → `T4`, `H100 80GB HBM3` → `H100-SXM`; `L40S` prefers `L40S` over
+`L40`). H100 defaults to the SXM form factor unless the SKU says PCIe, with `NVL`
+its own distinct per-GPU dense figure (835, not the 756 PCIe board).
+
+### FLOPs only — **$/hr stays operator-supplied**
+
+The table carries **NO `$/hr`**: a price is an operator input (a datasheet cannot
+know what a customer pays), so cost stays operator-supplied
+(`--device-spec-file` / `--cost-usd-per-hour`) and **degrades** (device is
+*unpriced*, never `$0`-faked) when absent. So a zero-config A10 box renders **real
+MFU but an unpriced wedge** until the operator supplies a rate.
+
+### Provenance (auditable origin + precision basis)
+
+| provenance key | meaning |
+|----------------|---------|
+| `<src>.builtin.peak.source = builtin-table:<model>@fp16-dense` | a peak was auto-resolved from the table for `<model>` at the FP16/BF16 dense basis |
+| `<src>.builtin.filled_devices = <uuid,...>` | which devices the table touched |
+| `<src>.spec.achieved_flops.source = derived:tensor-active*builtin-table-peak` | achieved-FLOPs was derived from the **real** tensor-active series × the table peak (the same identity as the default PromQL) |
+
+### Flag
+
+| flag | env | meaning (default) |
+|------|-----|-------------------|
+| `--builtin-peak-table` | `GPUFLEET_BUILTIN_PEAK_TABLE` | auto-resolve a missing peak from the built-in datasheet table by modelName (**default `true`**). Operator `--peak-tflops`/`--device-spec-file` and real telemetry still win. Set `false` for pure degrade-not-fabricate. |
+
+The table is applied **only on the REAL telemetry path**, NOT the mock default:
+the mock's synthetic `A10` devices include an intentionally peak-degraded device
+the demo relies on, so the **mock default stays byte-for-byte unchanged**
+(demo1 / CI regression green). NO `proto/` change (peak still rides the existing
+`DeviceJobMapping.PeakTflops`); FLOPs-only, no egress/Verdict edits.
+
 ## 5d. 数据新鲜度 / staleness (data freshness — TASK-0040)
 
 A read-only monitor must **never present stale data as current**. There are TWO

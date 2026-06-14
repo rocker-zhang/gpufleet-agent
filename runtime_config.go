@@ -78,6 +78,17 @@ type RuntimeConfig struct {
 	// the mock default, so a spec completes whichever metrics source is active.
 	Spec DeviceSpec
 
+	// PeakTable, when true, enables the BUILT-IN GPU peak-FLOPS table (TASK-0044):
+	// the LAST resort before degrade. After the real chain AND the operator spec
+	// have had first refusal, a device whose peak is STILL unknown has it resolved
+	// from the datasheet table keyed by DCGM modelName (FP16/BF16 dense), stamped
+	// peak.source=builtin-table:<model>@fp16-dense. An unknown model DEGRADES (no
+	// guess). It is FLOPs-only — $/hr stays operator-supplied. Default true so a
+	// zero-config box gets real MFU; an operator may disable it for pure
+	// degrade-not-fabricate. It wraps AFTER SpecFillCollector so the strict
+	// precedence (real > operator-explicit > built-in table > degrade) holds.
+	PeakTable bool
+
 	// NCCLLogPath, when set, points the log/event collector at an NCCL log file
 	// (read-only tail). Empty ⇒ NCCL stream unavailable (degrade). dmesg/kmsg is
 	// only read on the gpu build; on the default build the log source has no kmsg.
@@ -139,6 +150,11 @@ func (c RuntimeConfig) Collectors() (cols []Collector, mode CollectorMode) {
 		// box demo): the spec then completes any peak/cost the mock left unknown,
 		// stamped static-spec. With NO spec this is a transparent passthrough, so the
 		// no-endpoint mock default stays byte-for-byte backward compatible (demo1).
+		// The built-in peak table (TASK-0044) is DELIBERATELY NOT applied on the mock
+		// path: the mock's synthetic "A10" devices include an intentionally
+		// peak-degraded device (GPU-mock-0003) that the demo relies on to show the
+		// degrade-mark; auto-resolving it from the table would alter the demo's
+		// mock-default behavior. The table is a REAL-telemetry convenience only.
 		return c.applySpec(mock), CollectorModeMock
 	}
 
@@ -183,10 +199,16 @@ func (c RuntimeConfig) Collectors() (cols []Collector, mode CollectorMode) {
 
 	// Wrap the metrics chain with the static-spec fill (TASK-0038): when the real
 	// chain leaves peak/cost unknown, the operator's spec completes it (real wins;
-	// empty spec ⇒ passthrough), stamped static-spec for auditability.
+	// empty spec ⇒ passthrough), stamped static-spec for auditability. Then wrap
+	// the built-in peak table (TASK-0044) OUTSIDE the spec, so the strict
+	// precedence holds: real series (inner) > operator spec (SpecFill) > built-in
+	// table (PeakTable, last resort) > degrade. The table is FLOPs-only.
 	var metrics Collector = NewMetricsChain(primary, fallback)
 	if !c.Spec.Empty() {
 		metrics = SpecFillCollector{Inner: metrics, Spec: c.Spec}
+	}
+	if c.PeakTable {
+		metrics = PeakTableCollector{Inner: metrics, Enabled: true}
 	}
 	cols = []Collector{
 		metrics,
@@ -200,6 +222,9 @@ func (c RuntimeConfig) Collectors() (cols []Collector, mode CollectorMode) {
 // untouched. With an empty spec it returns `cols` unchanged — a transparent
 // passthrough preserving exact backward compatibility (the mock default path).
 // A metrics collector is identified by its SignalSource (Prometheus or DCGM).
+// The built-in peak table is intentionally NOT applied here (mock path) — see
+// Collectors(); only the operator's explicit spec fills the mock default. With an
+// empty spec, `cols` is returned unchanged (byte-for-byte backward compatible).
 func (c RuntimeConfig) applySpec(cols []Collector) []Collector {
 	if c.Spec.Empty() {
 		return cols

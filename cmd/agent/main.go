@@ -68,6 +68,15 @@ func main() {
 	peakTFLOPS := flag.Float64("peak-tflops", envFloat("GPUFLEET_PEAK_TFLOPS", 0),
 		"homogeneous-box peak TFLOP/s applied to every device missing a peak (quick alternative to a spec file); env GPUFLEET_PEAK_TFLOPS")
 
+	// TASK-0044 — built-in GPU peak-FLOPS table. The LAST resort before degrade:
+	// after the real chain and any operator spec/--peak-tflops, a device whose peak
+	// is STILL unknown has it auto-resolved from the datasheet table by DCGM
+	// modelName (FP16/BF16 dense), stamped builtin-table:<model>@fp16-dense. So a
+	// zero-config A10 box gets real MFU with NO --peak-tflops. Default ON; disable
+	// for pure degrade-not-fabricate. FLOPs-only: $/hr stays operator-supplied.
+	builtinPeakTable := flag.Bool("builtin-peak-table", envBool("GPUFLEET_BUILTIN_PEAK_TABLE", true),
+		"auto-resolve a missing peak from the built-in datasheet table by GPU modelName (FP16/BF16 dense); operator --peak-tflops/--device-spec-file and real telemetry still win; env GPUFLEET_BUILTIN_PEAK_TABLE")
+
 	// TASK-0038 — query/label override so an operator aligns to the real
 	// dcgm-exporter schema discovered in recon WITHOUT rebuilding.
 	qTensorActive := flag.String("query-tensor-active", envStr("GPUFLEET_QUERY_TENSOR_ACTIVE", ""),
@@ -117,7 +126,8 @@ func main() {
 			Model: *labelModel,
 			Job:   *labelJob,
 		},
-		Spec: spec,
+		Spec:      spec,
+		PeakTable: *builtinPeakTable,
 	}
 	cols, mode := rc.Collectors()
 	fmt.Fprintf(os.Stderr, "agent: collectors=%s (prometheus-url=%q dcgm-exporter-url=%q)\n",
