@@ -28,7 +28,21 @@ const mockNode = "mock-node"
 // achieved-FLOP/peak and tensor-active samples. It does NOT supply device->job
 // mappings (DCGM has no scheduler view) — that is the Prometheus/scheduler
 // source's job, and the normalizer marks the gap if no source supplies it.
-type MockDCGMCollector struct{ Node string }
+type MockDCGMCollector struct {
+	Node string
+	// InjectECCDBE, when set, adds a DCGM uncorrectable (double-bit) ECC counter
+	// DELTA per device UUID for tests/lab replay — the genuine DCGM leg of the
+	// ECC-uncorrectable gate signature. A real DCGM collector reads this from the
+	// DCGM_FI_DEV_ECC_DBE_VOL_TOTAL field; here it is injected deterministically.
+	// The default (nil) reports no ECC errors (a clean device).
+	InjectECCDBE map[string]uint64
+	// InjectTimeline, when set, adds pre-formed, DCGM-sourced timeline signals
+	// (e.g. a `device.lost.*` health corroboration) for tests/lab replay — the
+	// INDEPENDENT second source the XID79 gate needs. It stands in for a future
+	// real DCGM-health/"device lost" collector (carried follow-up): the default
+	// (nil) emits none, so the default mock ABSTAINs (RULES §B — no fabrication).
+	InjectTimeline []*gpufleetv1.TimelineEntry
+}
 
 func (c MockDCGMCollector) Source() gpufleetv1.SignalSource {
 	return gpufleetv1.SignalSource_SIGNAL_SOURCE_DCGM
@@ -59,6 +73,20 @@ func (c MockDCGMCollector) Collect(now time.Time, window time.Duration) (Observa
 		}
 	}
 
+	// ECC double-bit (DCGM counter) per-device deltas, injected for lab/test replay.
+	// A delta>0 here is a GENUINELY-reported DCGM ECC leg (normalize emits
+	// ecc.dbe.<uuid>@DCGM); absent/zero ⇒ no ECC signal (clean), never fabricated.
+	eccDBE := func(uuid string) (uint64, bool) {
+		if c.InjectECCDBE == nil {
+			return 0, false
+		}
+		v, ok := c.InjectECCDBE[uuid]
+		return v, ok
+	}
+	dbe1, k1 := eccDBE("GPU-mock-0001")
+	dbe2, k2 := eccDBE("GPU-mock-0002")
+	dbe3, k3 := eccDBE("GPU-mock-0003")
+
 	return Observation{
 		Source: c.Source(),
 		DcgmSeries: []*gpufleetv1.DcgmFieldSeries{
@@ -66,6 +94,7 @@ func (c MockDCGMCollector) Collect(now time.Time, window time.Duration) (Observa
 			series("GPU-mock-0002", 0.05),
 			series("GPU-mock-0003", 0.40),
 		},
+		Timeline: c.InjectTimeline,
 		DeviceWindows: []DeviceWindow{
 			{ // HEALTHY: ~70% MFU
 				UUID: "GPU-mock-0001", Node: node, Model: "A10", WindowSeconds: ws,
@@ -74,21 +103,27 @@ func (c MockDCGMCollector) Collect(now time.Time, window time.Duration) (Observa
 				PeakFLOPS: peakA10FLOPS, PeakFLOPSKnown: true,
 				// DCGM has no billing rate; cost is left unknown here and filled by
 				// the Prometheus/scheduler source on merge.
-				CostKnown: false,
+				CostKnown:         false,
+				ECCDoubleBitErrs:  dbe1,
+				ECCDoubleBitKnown: k1,
 			},
 			{ // IDLE: ~5% MFU
 				UUID: "GPU-mock-0002", Node: node, Model: "A10", WindowSeconds: ws,
 				AchievedFLOPs: 0.05 * peakA10FLOPS * ws, AchievedFLOPsKnown: true,
 				TensorActiveSecs: 0.05 * ws, TensorActiveKnown: true,
 				PeakFLOPS: peakA10FLOPS, PeakFLOPSKnown: true,
-				CostKnown: false,
+				CostKnown:         false,
+				ECCDoubleBitErrs:  dbe2,
+				ECCDoubleBitKnown: k2,
 			},
 			{ // PEAK MISSING from DCGM: MFU cannot be computed from this source.
 				UUID: "GPU-mock-0003", Node: node, Model: "A10", WindowSeconds: ws,
 				AchievedFLOPs: 0.40 * peakA10FLOPS * ws, AchievedFLOPsKnown: true,
 				TensorActiveSecs: 0.40 * ws, TensorActiveKnown: true,
-				PeakFLOPSKnown: false, // <-- degraded: no peak from DCGM
-				CostKnown:      false,
+				PeakFLOPSKnown:    false, // <-- degraded: no peak from DCGM
+				CostKnown:         false,
+				ECCDoubleBitErrs:  dbe3,
+				ECCDoubleBitKnown: k3,
 			},
 		},
 		Provenance: map[string]string{
@@ -199,5 +234,62 @@ func DefaultCollectors(node string) []Collector {
 		MockDCGMCollector{Node: node},
 		MockPrometheusCollector{Node: node},
 		MockDmesgCollector{Node: node},
+	}
+}
+
+// FaultInjectCollectors returns the default mock sources wired to inject a FULL
+// 2-independent-source pattern for BOTH ECC-uncorrectable and XID 79, so a local
+// run / lab replay makes the open gate FIRE the right class instead of ABSTAIN.
+// It is the M3 demo vehicle; the plain DefaultCollectors ABSTAIN (clean node).
+//
+// Each injected fault carries TWO INDEPENDENT real-shaped legs (RULES §B — these
+// are explicit lab-replay injections representing what real second-source
+// collectors WOULD observe, never normalizer-synthesized corroboration):
+//
+//   - ECC on GPU-mock-0002:  ECC-XID 94 @ DMESG_XID  +  DCGM ECC double-bit
+//     counter delta @ DCGM  →  FAULT_CLASS_ECC_UNCORRECTABLE.
+//   - XID79 on GPU-mock-0001:  Xid 79 @ DMESG_XID  +  a `device.lost.dcgm.*`
+//     health corroboration @ DCGM  →  FAULT_CLASS_GPU_FALLEN_OFF_BUS.
+//
+// The first registered signature to match wins (registry order: XID79 then ECC),
+// but the two classes' leg patterns are disjoint so both verdicts are reachable
+// by selecting the injected pattern; this helper injects BOTH so a single window
+// demonstrates a FIRE (the engine returns the first match — XID79).
+func FaultInjectCollectors(node string) []Collector {
+	if node == "" {
+		node = mockNode
+	}
+	now := time.Now()
+	return []Collector{
+		MockDCGMCollector{
+			Node: node,
+			// DCGM ECC double-bit counter leg for the ECC signature (GPU-mock-0002).
+			InjectECCDBE: map[string]uint64{"GPU-mock-0002": 3},
+			// Independent DCGM "device lost" health leg for the XID79 signature
+			// (GPU-mock-0001). Source MUST be DCGM (normalize validates it).
+			InjectTimeline: []*gpufleetv1.TimelineEntry{{
+				Ts:         timestamppb.New(now),
+				Source:     gpufleetv1.SignalSource_SIGNAL_SOURCE_DCGM,
+				DeviceUuid: "GPU-mock-0001",
+				SignalId:   "device.lost.dcgm.GPU-mock-0001",
+				Label:      "DCGM health: device unreachable on the bus (GPU-mock-0001)",
+			}},
+		},
+		MockPrometheusCollector{Node: node},
+		MockDmesgCollector{
+			Node: node,
+			Inject: []*gpufleetv1.XidEvent{
+				{ // XID79 dmesg leg for GPU-mock-0001.
+					Ts: timestamppb.New(now), DeviceUuid: "GPU-mock-0001", Xid: 79,
+					RawMessage: "NVRM: Xid (PCI:0000:65:00): 79, GPU has fallen off the bus",
+					Severity:   "err",
+				},
+				{ // ECC-XID leg (public ECC XID 94) for GPU-mock-0002.
+					Ts: timestamppb.New(now), DeviceUuid: "GPU-mock-0002", Xid: 94,
+					RawMessage: "NVRM: Xid (PCI:0000:66:00): 94, Contained ECC error",
+					Severity:   "err",
+				},
+			},
+		},
 	}
 }

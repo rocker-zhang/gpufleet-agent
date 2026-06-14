@@ -7,6 +7,8 @@ import (
 	"sync"
 	"time"
 
+	gpufleetv1 "github.com/rocker-zhang/gpufleet-proto/gen/go/gpufleet/v1"
+	"github.com/rocker-zhang/gpufleet-rca/registry"
 	semantics "github.com/rocker-zhang/gpufleet-semantics"
 )
 
@@ -26,6 +28,16 @@ type State struct {
 	Cost      CostReport
 	RefreshAt time.Time
 	Refreshes uint64 // monotonically increasing refresh counter
+
+	// Verdict is the local deterministic gate verdict for THIS window, produced by
+	// running the OPEN rca engine (registry.NewDefaultEngine().Evaluate) over the
+	// window's EvidencePack at publish time (M3 keystone: the open agent runs the
+	// open gate locally). It is ABSTAIN unless >=2 INDEPENDENT corroborating
+	// signals fired a class (RULES §B). It is computed OFF-PATH — a gate error or
+	// panic is isolated and never blanks/blocks the window (RULES §A), in which
+	// case Verdict is nil and the window is still served. Read-only; never sent
+	// anywhere from here (the cli reads it off-path via /verdict).
+	Verdict *gpufleetv1.Verdict
 }
 
 // Freshness is the agent-side data-freshness verdict for the live State,
@@ -163,6 +175,25 @@ func softCollectErr(err error) bool {
 	return errors.Is(err, ErrProfilingCapped)
 }
 
+// evalVerdict runs the OPEN rca gate over the window's EvidencePack and returns
+// the resulting Verdict, guarded so a gate error/panic is ISOLATED off-path
+// (RULES §A): a bug or panic inside the engine must never blank or block the
+// published window. On a panic (or a nil window/pack) it returns nil — the window
+// is still served, just without a verdict — exactly as a collection error is
+// isolated. The engine itself is deterministic (no clock, no randomness; rca §1),
+// so the verdict for a given window is stable across calls.
+func evalVerdict(win *SignalWindow) (v *gpufleetv1.Verdict) {
+	if win == nil || win.Pack == nil {
+		return nil
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			v = nil // isolate: a gate panic never affects the window or a job.
+		}
+	}()
+	return registry.NewDefaultEngine().Evaluate(win.Pack)
+}
+
 // Refresh performs one collection->normalize->cost cycle and publishes a new
 // State. It is safe to call with no client attached. A collector or normalize
 // error is recorded but never panics; the previous State is left in place so a
@@ -254,7 +285,15 @@ func (d *Daemon) Refresh(ctx context.Context) error {
 		return err
 	}
 
-	newState := &State{Window: win, Cost: cost, RefreshAt: now}
+	// Run the OPEN deterministic gate locally over this window's EvidencePack and
+	// attach the resulting Verdict (M3 keystone). The gate is OFF-PATH (RULES §A):
+	// it never affects collection, and a gate error/panic is isolated by
+	// evalVerdict so a bug there can never blank or block the published window — it
+	// degrades to a nil Verdict, the window is still served. Deterministic: the
+	// engine does not consult a clock or randomness (rca §1).
+	verdict := evalVerdict(win)
+
+	newState := &State{Window: win, Cost: cost, RefreshAt: now, Verdict: verdict}
 	d.mu.Lock()
 	prev := uint64(0)
 	if d.state != nil {

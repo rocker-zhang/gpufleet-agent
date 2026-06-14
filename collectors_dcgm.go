@@ -47,6 +47,14 @@ const (
 	// real DCGM collector reference one definition.
 	dcgmSymPipeTensorActive    = "DCGM_FI_PROF_PIPE_TENSOR_ACTIVE"
 	dcgmFIProfPipeTensorActive = 1003
+
+	// dcgmSymECCDBETotal is the public DCGM field for the lifetime count of
+	// volatile UNCORRECTABLE (double-bit) ECC errors. It is the DCGM leg of the
+	// ECC-uncorrectable gate signature: a delta>0 over the window, corroborated by
+	// an INDEPENDENT dmesg ECC Xid, fires FAULT_CLASS_ECC_UNCORRECTABLE. PUBLIC
+	// field only (RULES §F). Read-only counter; the agent reports the delta, never
+	// resets it.
+	dcgmSymECCDBETotal = "DCGM_FI_DEV_ECC_DBE_VOL_TOTAL"
 )
 
 // dcgmProfilingSymbols is the set of profiling fields subject to the burst cap.
@@ -95,6 +103,12 @@ type DCGMExporterCollector struct {
 
 	mu          sync.Mutex
 	lastScrapeT time.Time
+	// prevDBE holds the last-seen cumulative uncorrectable-ECC (double-bit) counter
+	// per device UUID, so Collect can report the DELTA over the window rather than
+	// the lifetime total. ECC DBE is a cumulative counter: a delta requires two
+	// readings, so the FIRST scrape establishes the baseline and reports no delta
+	// (honest — a single reading is not evidence of a new error this window).
+	prevDBE map[string]uint64
 }
 
 // DefaultProfilingBurstInterval is the default floor between profiling-burst
@@ -180,7 +194,43 @@ func (c *DCGMExporterCollector) Collect(now time.Time, window time.Duration) (Ob
 	if resp.StatusCode != http.StatusOK {
 		return Observation{}, fmt.Errorf("agent: dcgm-exporter scrape status %d", resp.StatusCode)
 	}
-	return parseDCGMExposition(resp.Body, now, window, c.nodeOrDefault())
+	obs, err := parseDCGMExposition(resp.Body, now, window, c.nodeOrDefault())
+	if err != nil {
+		return Observation{}, err
+	}
+	c.applyDBEDelta(obs.DeviceWindows)
+	return obs, nil
+}
+
+// applyDBEDelta converts each device's cumulative uncorrectable-ECC counter (as
+// parsed) into the per-WINDOW delta against the last scrape, updating the stored
+// baseline. ECC DBE is a monotonic counter, so the delta (not the lifetime total)
+// is the evidence of a NEW error this window. The first reading establishes the
+// baseline and reports a zero delta — a single cumulative reading is not, by
+// itself, evidence of a new error (honesty, RULES §B). A counter reset (current <
+// prior, e.g. driver reload) is clamped to zero rather than reported as a huge
+// spurious delta.
+func (c *DCGMExporterCollector) applyDBEDelta(dws []DeviceWindow) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.prevDBE == nil {
+		c.prevDBE = map[string]uint64{}
+	}
+	for i := range dws {
+		dw := &dws[i]
+		if !dw.ECCDoubleBitKnown {
+			continue
+		}
+		cur := dw.ECCDoubleBitErrs
+		prev, seen := c.prevDBE[dw.UUID]
+		c.prevDBE[dw.UUID] = cur
+		switch {
+		case !seen || cur < prev:
+			dw.ECCDoubleBitErrs = 0 // baseline / counter reset ⇒ no delta this window.
+		default:
+			dw.ECCDoubleBitErrs = cur - prev
+		}
+	}
 }
 
 func (c *DCGMExporterCollector) nodeOrDefault() string {
@@ -282,6 +332,15 @@ func parseDCGMExposition(r io.Reader, now time.Time, window time.Duration, nodeF
 			// SM_ACTIVE is a utilization ratio; without a known peak we cannot
 			// turn it into absolute FLOPs, so we do NOT fabricate AchievedFLOPs
 			// here. It is carried raw (series) for downstream corroboration.
+		case dcgmSymECCDBETotal:
+			// Cumulative uncorrectable (double-bit) ECC counter. Carry the lifetime
+			// total here as "known"; Collect converts it to a per-window DELTA
+			// against the prior reading (a single cumulative reading is not, by
+			// itself, evidence of a NEW error this window).
+			if s.value >= 0 {
+				a.dw.ECCDoubleBitErrs = uint64(s.value)
+				a.dw.ECCDoubleBitKnown = true
+			}
 		}
 	}
 

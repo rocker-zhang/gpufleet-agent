@@ -52,6 +52,12 @@ func main() {
 		"collector set: auto|mock|real (auto = real if any endpoint given, else mock); env GPUFLEET_COLLECTORS")
 	ncclLog := flag.String("nccl-log", envStr("GPUFLEET_NCCL_LOG", ""),
 		"NCCL log file to tail read-only (real collectors only); env GPUFLEET_NCCL_LOG")
+	// TASK-0048 — M3 demo vehicle. Swap the mock sources for fault-injecting mock
+	// sources that emit a FULL 2-independent-source pattern (ECC + XID79) so the
+	// local rca gate FIRES a real Verdict on /verdict. Mock build only (no effect
+	// on the real/gpu path); the default ABSTAINs (clean node).
+	injectFaults := flag.Bool("inject-faults", envBool("GPUFLEET_INJECT_FAULTS", false),
+		"DEMO/LAB: inject a 2-source ECC+XID79 fault pattern (mock build only) so the gate FIRES; env GPUFLEET_INJECT_FAULTS")
 	profilingBurst := flag.Bool("profiling-burst", envBool("GPUFLEET_PROFILING_BURST", false),
 		"opt into high-resolution DCGM profiling scrapes, frequency-capped by --profiling-cap; env GPUFLEET_PROFILING_BURST")
 	profilingCap := flag.Duration("profiling-cap", envDur("GPUFLEET_PROFILING_CAP", agent.DefaultProfilingBurstInterval),
@@ -130,6 +136,13 @@ func main() {
 		PeakTable: *builtinPeakTable,
 	}
 	cols, mode := rc.Collectors()
+	if *injectFaults {
+		if fc := faultInjectCollectors(*node); fc != nil {
+			cols, mode = fc, "mock+inject-faults"
+		} else {
+			fmt.Fprintf(os.Stderr, "agent: --inject-faults ignored (mock build only)\n")
+		}
+	}
 	fmt.Fprintf(os.Stderr, "agent: collectors=%s (prometheus-url=%q dcgm-exporter-url=%q)\n",
 		mode, *promURL, *dcgmURL)
 
@@ -180,7 +193,7 @@ func main() {
 	go func() { _ = d.Run(ctx, *interval) }()
 
 	srv := &http.Server{Addr: *addr, Handler: agent.NewAPI(d).Handler()}
-	fmt.Fprintf(os.Stderr, "agent: local read-only API listening on %s (GET /signals /cost /window /healthz); staleness-after=%s\n", *addr, staleAfter)
+	fmt.Fprintf(os.Stderr, "agent: local read-only API listening on %s (GET /signals /cost /verdict /window /healthz); staleness-after=%s\n", *addr, staleAfter)
 	go func() {
 		<-ctx.Done()
 		shutCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)

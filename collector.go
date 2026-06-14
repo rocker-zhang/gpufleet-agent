@@ -69,6 +69,17 @@ type Observation struct {
 	// the cost wedge consumes scalar window aggregates, not raw sample streams.
 	DeviceWindows []DeviceWindow
 
+	// Timeline are pre-formed, citable timeline signals this collector OBSERVED
+	// directly (already carrying a stable signal_id + this source). The normalizer
+	// appends them verbatim onto the pack timeline so the rca gate can match them.
+	// It is the channel for a source whose fault signal is not one of the structured
+	// XidEvent/NcclEvent/ECC-counter shapes the normalizer derives (e.g. a future
+	// "device lost / link down" health collector). HONESTY (RULES §B): a collector
+	// MUST populate this ONLY with signals it genuinely observed — the normalizer
+	// never invents these; it only carries what a source actually reports. The
+	// Source on each entry MUST equal the collector's Source (provenance integrity).
+	Timeline []*gpufleetv1.TimelineEntry
+
 	// Provenance is free-form, non-adjudicating collection metadata (hostnames,
 	// exporter versions, scrape intervals). Keys are collector-defined.
 	Provenance map[string]string
@@ -106,4 +117,13 @@ type DeviceWindow struct {
 	// CostKnown; unknown cost ⇒ the wedge reports unpriced, never a fabricated $.
 	CostPerHour float64
 	CostKnown   bool
+
+	// ECCDoubleBitErrs is the DCGM uncorrectable (double-bit) ECC counter DELTA
+	// observed over the window (the public DCGM_FI_DEV_ECC_DBE_VOL_TOTAL field).
+	// Valid only when ECCDoubleBitKnown; it is the DCGM leg of the ECC-uncorrectable
+	// gate signature. A delta>0 is emitted as an `ecc.dbe.<uuid>`@DCGM timeline
+	// signal (normalize.go); a source that does not read the ECC counter leaves
+	// ECCDoubleBitKnown false and no signal is emitted (degrade, never fabricate).
+	ECCDoubleBitErrs  uint64
+	ECCDoubleBitKnown bool
 }

@@ -113,6 +113,68 @@ Semantics that consumers (cli) MUST honor:
 This is a **read-only透出** of `semantics.CostImpact` — no wedge compute change,
 no write-back (RULES §A).
 
+## 5f. `/verdict` 本地只读 gate 输出 (local Verdict wire contract — TASK-0048)
+
+`GET /verdict` serves the agent's **local deterministic gate Verdict** for the
+live window — the M3 keystone: the **open agent runs the open `rca` gate
+locally** (`registry.NewDefaultEngine().Evaluate(window.Pack)`) at State-publish
+time and透出s the result here. Unlike `/cost`/`/healthz` (untyped JSON, §5a),
+`/verdict` is the **real `gpufleet.v1.Verdict` proto**, served as **canonical
+protojson** exactly like `/signals`, so the cli (TASK-0049) parses it back with
+`protojson.Unmarshal` into the generated type. The SAME bytes are embedded under
+`"verdict"` in `/window`.
+
+```
+GET /verdict  →  200  application/json   (canonical gpufleet.v1.Verdict protojson)
+              →  503  before the first window (like /signals)
+              →  405  on any non-GET verb (read-only, RULES §A)
+```
+
+Wire shape (real FIRE example — injected ECC+XID79 demo, `--inject-faults`):
+
+```json
+{
+  "contractVersion": "v1",
+  "faultClass": "FAULT_CLASS_GPU_FALLEN_OFF_BUS",
+  "confidence": 0.95,
+  "citedSignals": [
+    { "signalId": "device.lost.dcgm.GPU-mock-0001", "source": "SIGNAL_SOURCE_DCGM",     "ts": "...", "note": "..." },
+    { "signalId": "dmesg.xid79.GPU-mock-0001",       "source": "SIGNAL_SOURCE_DMESG_XID", "ts": "...", "note": "..." }
+  ],
+  "playbookId": "GATE_SIGNATURE_XID79_FALLEN_OFF_BUS",
+  "signature":  "GATE_SIGNATURE_XID79_FALLEN_OFF_BUS"
+}
+```
+
+Semantics consumers (cli) MUST honor:
+- **ABSTAIN is the default + safe state.** With no fault, or fewer than **2
+  independent corroborating sources**, `faultClass = FAULT_CLASS_ABSTAIN`,
+  `confidence = 1.0` (confidence *in abstaining*), `citedSignals` empty,
+  `signature = GATE_SIGNATURE_UNSPECIFIED` (RULES §B). A window whose gate was
+  isolated off-path (a recovered gate panic) also renders an explicit ABSTAIN,
+  never a fabricated class and never a 5xx.
+- **A FIRED verdict** carries `confidence >= 0.95` and **>=2 `citedSignals` with
+  distinct `source`s** — independence is judged on `SignalSource`, never a
+  declared field. `narration`/`costImpact` are **unset** here (open gate emits no
+  narration — that is closed-controlplane only, RULES §B/§E).
+- **The cited `signalId`s are the real timeline legs** the agent emitted from
+  genuinely collected data: `dmesg.xid79.<dev>`@DMESG_XID, `dmesg.xid.ecc.<n>.<dev>`
+  @DMESG_XID, `nccl.timeout.<scope>`@NCCL, `ecc.dbe.<uuid>`@DCGM (and an injected
+  `device.lost.*`@DCGM demo leg). They cross-reference `/signals` timeline entries
+  (`evidence_grounding`): the gate never cites a signal not present in the window.
+
+**Honesty / current real coverage (RULES §B — degrade-never-fabricate).** With
+the **current real collectors**, only **ECC** has two independent real legs
+(ECC-XID@DMESG_XID + DCGM ECC double-bit counter@DCGM), so only ECC can genuinely
+**FIRE** on a real node. **XID79 / NCCL / LINK ABSTAIN** until their second-source
+collectors land (device-lost@DCGM, collective-stall, link-degraded) — that is
+**correct, not a bug**: the agent emits its single real leg and NEVER synthesizes
+the missing corroborator (which would forge the >=2-independent-signal gate, the
+product's most load-bearing trust property). These are carried follow-up cards.
+The `--inject-faults` flag (mock build) injects a full 2-source ECC+XID79 pattern
+for the M3 demo; the default mock ABSTAINs. The gate runs **off-path** — a gate
+error/panic is isolated and never blanks or blocks the window (RULES §A).
+
 ## 5b. 指向真实端点 (point at real Prometheus/DCGM — TASK-0037)
 
 By default `agent -serve` runs the **mock** collectors (demo1 / CI, GPU-less). To

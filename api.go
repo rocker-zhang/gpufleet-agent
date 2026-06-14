@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"time"
 
+	gpufleetv1 "github.com/rocker-zhang/gpufleet-proto/gen/go/gpufleet/v1"
 	semantics "github.com/rocker-zhang/gpufleet-semantics"
 	"google.golang.org/protobuf/encoding/protojson"
 )
@@ -27,12 +28,14 @@ func NewAPI(d *Daemon) *API { return &API{d: d} }
 //	GET /healthz       — liveness; reports refresh count + error count.
 //	GET /signals       — the latest gpufleet.v1 EvidencePack (SignalSchema window).
 //	GET /cost          — the latest standalone cost wedge (per-device + per-job).
+//	GET /verdict       — the latest local gpufleet.v1 Verdict (rca gate output).
 //	GET /window        — combined: window meta + degradation marks + cost summary.
 func (a *API) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", a.readOnly(a.handleHealth))
 	mux.HandleFunc("/signals", a.readOnly(a.handleSignals))
 	mux.HandleFunc("/cost", a.readOnly(a.handleCost))
+	mux.HandleFunc("/verdict", a.readOnly(a.handleVerdict))
 	mux.HandleFunc("/window", a.readOnly(a.handleWindow))
 	return mux
 }
@@ -135,6 +138,52 @@ func (a *API) handleSignals(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(b)
+}
+
+// handleVerdict serves the latest local gate Verdict as canonical protojson (the
+// real gpufleet.v1 wire shape), the same style as /signals. The Verdict is the
+// OPEN rca gate's deterministic output for the live window: ABSTAIN unless >=2
+// INDEPENDENT corroborating signals fired a class (RULES §B). Like /signals it is
+// 503 before the first window is collected. It is READ-ONLY (GET only, enforced
+// by readOnly) — the agent never originates egress here; the cli reads it
+// off-path.
+//
+// If a window was published but the gate was isolated off-path (Verdict nil —
+// e.g. a gate panic was recovered, RULES §A), this still returns 200 with an
+// explicit ABSTAIN (FAULT_CLASS_ABSTAIN) so a consumer never has to distinguish
+// "no verdict" from a blanked window: the safe default is ABSTAIN, never a
+// fabricated class.
+func (a *API) handleVerdict(w http.ResponseWriter, _ *http.Request) {
+	st := a.d.Snapshot()
+	if st == nil || st.Window == nil {
+		http.Error(w, "no signal window collected yet", http.StatusServiceUnavailable)
+		return
+	}
+	b, err := marshalVerdict(st)
+	if err != nil {
+		http.Error(w, "marshal verdict: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(b)
+}
+
+// marshalVerdict renders a State's local gate Verdict as canonical gpufleet.v1
+// protojson — the single source of the /verdict + /window verdict wire shape so
+// they never drift. A nil Verdict (gate isolated off-path) degrades to an
+// explicit ABSTAIN, never a fabricated class (RULES §B). Caller guarantees a
+// non-nil Window/Pack.
+func marshalVerdict(st *State) ([]byte, error) {
+	v := st.Verdict
+	if v == nil {
+		v = &gpufleetv1.Verdict{
+			ContractVersion: st.Window.Pack.GetContractVersion(),
+			FaultClass:      gpufleetv1.FaultClass_FAULT_CLASS_ABSTAIN,
+			Confidence:      1.0,
+		}
+	}
+	return protojson.MarshalOptions{Multiline: true, Indent: "  "}.Marshal(v)
 }
 
 // DeviceCost is one device's cost wedge in the API's JSON shape.
@@ -268,14 +317,21 @@ func (a *API) handleCost(w http.ResponseWriter, _ *http.Request) {
 }
 
 // WindowResponse is the /window combined read-only view.
+//
+// Verdict carries the live window's local gate Verdict as canonical gpufleet.v1
+// protojson (the SAME wire shape /verdict serves), embedded so a consumer gets
+// window meta + cost + verdict in one read. It is ABSTAIN unless the gate fired a
+// class on >=2 independent signals (RULES §B); never omitted (a window always has
+// a verdict view — an isolated/nil gate degrades to an explicit ABSTAIN).
 type WindowResponse struct {
-	ContractVersion string        `json:"contract_version"`
-	AgentID         string        `json:"agent_id"`
-	WindowStart     time.Time     `json:"window_start"`
-	WindowEnd       time.Time     `json:"window_end"`
-	Sources         []string      `json:"sources"`
-	Degraded        []DegradeMark `json:"degraded"`
-	Cost            CostResponse  `json:"cost"`
+	ContractVersion string          `json:"contract_version"`
+	AgentID         string          `json:"agent_id"`
+	WindowStart     time.Time       `json:"window_start"`
+	WindowEnd       time.Time       `json:"window_end"`
+	Sources         []string        `json:"sources"`
+	Degraded        []DegradeMark   `json:"degraded"`
+	Cost            CostResponse    `json:"cost"`
+	Verdict         json.RawMessage `json:"verdict"`
 }
 
 func (a *API) handleWindow(w http.ResponseWriter, _ *http.Request) {
@@ -295,6 +351,13 @@ func (a *API) handleWindow(w http.ResponseWriter, _ *http.Request) {
 	if costSt == nil {
 		costSt = st
 	}
+	// Embed the live window's local gate Verdict (from the freshest window st) as
+	// canonical protojson — the same wire shape /verdict serves. A marshal failure
+	// is isolated: the rest of the window view is still served (RULES §A).
+	vb, err := marshalVerdict(st)
+	if err != nil {
+		vb = nil
+	}
 	resp := WindowResponse{
 		ContractVersion: st.Window.Pack.ContractVersion,
 		AgentID:         st.Window.Pack.AgentId,
@@ -303,6 +366,7 @@ func (a *API) handleWindow(w http.ResponseWriter, _ *http.Request) {
 		Sources:         srcs,
 		Degraded:        st.Window.Degraded,
 		Cost:            stampFreshness(costResponse(costSt), a.d.Freshness()),
+		Verdict:         json.RawMessage(vb),
 	}
 	writeJSON(w, http.StatusOK, resp)
 }

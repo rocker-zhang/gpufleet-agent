@@ -4,6 +4,7 @@ go 1.26.0
 
 require (
 	github.com/rocker-zhang/gpufleet-proto/gen/go v0.1.0
+	github.com/rocker-zhang/gpufleet-rca v0.0.0
 	github.com/rocker-zhang/gpufleet-semantics v0.0.0
 	google.golang.org/protobuf v1.36.11
 )
@@ -23,3 +24,5 @@ require (
 replace github.com/rocker-zhang/gpufleet-proto/gen/go => ../proto/gen/go
 
 replace github.com/rocker-zhang/gpufleet-semantics => ../semantics
+
+replace github.com/rocker-zhang/gpufleet-rca => ../rca
