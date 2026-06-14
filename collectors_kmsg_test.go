@@ -45,10 +45,17 @@ func (r *slowReader) Read(p []byte) (int, error) {
 }
 
 // TestBoundedReadNeverBlocksPastDeadline is the core no-stall guarantee
-// (TASK-0033 #1): with a NEVER-ending reader, boundedReadStream must return
-// within (a small multiple of) the deadline and NEVER drain the full byte cap.
-// We assert both the wall-clock bound and that it stopped on the deadline. This
-// runs with NO hardware — the never-ending reader stands in for /dev/kmsg.
+// (TASK-0033 #1): with a NEVER-ending reader, boundedReadStream MUST return
+// well before any node-stall — stopped by EITHER the deadline OR the byte cap —
+// and MUST NOT run unbounded. The exact leg that fires (deadline vs cap) is
+// HARDWARE-DEPENDENT: on a fast/arm box (e.g. a fast arm64 box) a never-ending
+// reader can drain even a large cap in tens of ms, before a ~50ms deadline; on a
+// slow box the deadline wins. Asserting one specific leg is hardware-fragile, so
+// the no-stall PROPERTY we assert is "bounded by deadline-OR-cap, within a
+// generous wall-clock ceiling, never unbounded". The deadline leg specifically is
+// exercised deterministically by the paced sub-case below and by
+// TestBoundedReadSlowReader / TestBoundedReadDeadlineDeterministic. This runs
+// with NO hardware — the never-ending reader stands in for /dev/kmsg.
 func TestBoundedReadNeverBlocksPastDeadline(t *testing.T) {
 	deadline := 50 * time.Millisecond
 	r := &neverEndingReader{chunk: []byte(strings.Repeat("a", 4096))}
@@ -59,8 +66,8 @@ func TestBoundedReadNeverBlocksPastDeadline(t *testing.T) {
 	var res boundedReadResult
 	go func() {
 		got, res, _ = boundedReadStream(r, boundedReadConfig{
-			MaxBytes: 64 << 20, // huge cap so ONLY the deadline can stop it
-			Deadline: deadline,
+			MaxBytes: 64 << 20, // cap large enough that the deadline usually wins...
+			Deadline: deadline, // ...but on fast hardware the cap can win first — either is fine.
 		})
 		close(done)
 	}()
@@ -68,26 +75,50 @@ func TestBoundedReadNeverBlocksPastDeadline(t *testing.T) {
 	// Hard ceiling: if the read is not bounded, this fails instead of hanging the
 	// suite forever. We give the deadline generous slack (10x) for scheduler jitter
 	// under -race, but it is still a finite bound that a never-ending read would blow.
+	// This 10x bound is FAR below any realistic node-stall threshold, so meeting it
+	// IS the no-stall guarantee regardless of which leg (deadline/cap) fired.
+	stallCeiling := deadline * 10
 	select {
 	case <-done:
-	case <-time.After(deadline * 10):
-		t.Fatalf("bounded read BLOCKED past %v with a never-ending reader (no-stall guarantee violated)", deadline*10)
+	case <-time.After(stallCeiling):
+		t.Fatalf("bounded read BLOCKED past %v with a never-ending reader (no-stall guarantee violated)", stallCeiling)
 	}
 	elapsed := time.Since(start)
 
-	if !res.HitDeadline {
-		t.Fatalf("bounded read should have stopped on the DEADLINE, got result %+v", res)
+	// Safety property: the drain ALWAYS stopped on a BOUND (deadline OR cap), never
+	// ran unbounded. Which bound fired is hardware-dependent and not asserted here.
+	if !res.HitDeadline && !res.HitCap {
+		t.Fatalf("bounded read must stop on the deadline OR the byte cap, got result %+v", res)
 	}
-	if res.HitCap {
-		t.Fatalf("bounded read must NOT have drained the full byte cap from a never-ending reader: %+v", res)
+	if int64(len(got)) > 64<<20 {
+		t.Fatalf("bounded read exceeded the byte cap (%d bytes) — bound violated", len(got))
 	}
-	if int64(len(got)) >= 64<<20 {
-		t.Fatalf("bounded read drained the whole cap (%d bytes) — it would have stalled the node", len(got))
+	if elapsed > stallCeiling {
+		t.Fatalf("bounded read took %v, far past the %v no-stall ceiling", elapsed, stallCeiling)
 	}
-	if elapsed > deadline*10 {
-		t.Fatalf("bounded read took %v, far past the %v deadline", elapsed, deadline)
-	}
-	t.Logf("never-ending reader bounded: %d bytes in %v over %d reads (deadline=%v)", len(got), elapsed, r.reads, deadline)
+	t.Logf("never-ending reader bounded: %d bytes in %v over %d reads (deadline=%v, hitDeadline=%v hitCap=%v)",
+		len(got), elapsed, r.reads, deadline, res.HitDeadline, res.HitCap)
+
+	// Deadline leg, deterministic on ANY hardware: a PACED reader trickles far too
+	// slowly to drain the (here huge) cap within the deadline, so TIME must win. This
+	// pins the deadline branch specifically without depending on box speed.
+	t.Run("deadline_leg_paced", func(t *testing.T) {
+		dl := 30 * time.Millisecond
+		s := time.Now()
+		_, pres, _ := boundedReadStream(&slowReader{pause: 2 * time.Millisecond}, boundedReadConfig{
+			MaxBytes: 64 << 20, // so large the paced trickle cannot reach it before the deadline
+			Deadline: dl,
+		})
+		if !pres.HitDeadline {
+			t.Fatalf("paced reader drain should end on the DEADLINE (cap unreachable in time): %+v", pres)
+		}
+		if pres.HitCap {
+			t.Fatalf("paced reader must NOT have hit the byte cap within %v: %+v", dl, pres)
+		}
+		if el := time.Since(s); el > dl*10 {
+			t.Fatalf("paced deadline drain took %v, far past the %v deadline", el, dl)
+		}
+	})
 }
 
 // TestBoundedReadDeadlineDeterministic uses an INJECTED clock to assert the
