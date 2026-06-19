@@ -188,14 +188,13 @@ func (c RuntimeConfig) Collectors() (cols []Collector, mode CollectorMode) {
 	}
 
 	// The log/event collector rounds out the >=2-signal picture (dmesg/XID +
-	// NCCL). On the default build kmsg is unavailable; on the gpu build the caller
-	// uses DefaultCollectors' real kmsg source instead. NCCL, when a path is given,
-	// is tailed READ-ONLY per-window (a missing/garbage file degrades, never
-	// crashes).
-	var logSrc LogSource = FixtureLogSource{}
-	if c.NCCLLogPath != "" {
-		logSrc = fileNCCLSource{path: c.NCCLLogPath}
-	}
+	// NCCL). realLogSource is a build-tagged seam (TASK-0056): on the gpu build it
+	// tails the REAL /dev/kmsg (+ optional NCCL file) so `--collectors real`
+	// genuinely collects the dmesg/XID leg (before this, the real branch hardcoded
+	// a fixture source → read no kmsg → XID79/ECC-XID could never fire on real HW);
+	// on the default build it degrades to a fixture/NCCL-file source (no kmsg).
+	// READ-ONLY per-window; a missing/garbage stream degrades, never crashes.
+	logSrc := realLogSource(c.NCCLLogPath)
 
 	// Wrap the metrics chain with the static-spec fill (TASK-0038): when the real
 	// chain leaves peak/cost unknown, the operator's spec completes it (real wins;

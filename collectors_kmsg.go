@@ -6,6 +6,7 @@ import (
 	"io"
 	"runtime"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -19,6 +20,41 @@ import (
 // sources_gpu.go; the bounded-read LOGIC lives HERE, with NO build tag and an
 // INJECTED reader, so it is unit-testable on the default build with a slow /
 // never-ending reader and we can assert it NEVER blocks past the deadline.
+//
+// The reader the gpu build injects is rawNonblockReader (also here, build-
+// agnostic + testable): it reads a raw O_NONBLOCK fd via syscall.Read. This is
+// REQUIRED for /dev/kmsg — an *os.File* wrapping a pollable char device routes
+// Read() through Go's runtime poller, which PARKS the goroutine on EAGAIN
+// (waiting for the next kernel message) instead of returning. That park happens
+// INSIDE Read(), so boundedReadStream's between-read deadline never fires and the
+// collector hangs until the kernel logs a new line — observed on real hardware
+// (TASK-0057); the fixture tests never exercised a real fd. Reading the raw fd
+// returns EAGAIN promptly, mapped to (0,nil) so the deadline/cap/kill bound it.
+
+// rawNonblockReader reads a raw O_NONBLOCK file descriptor via syscall.Read,
+// deliberately bypassing *os.File / internal/poll so an EAGAIN does NOT park on
+// the runtime poller. EAGAIN/EWOULDBLOCK ("nothing buffered right now") maps to
+// (0, nil) — boundedReadStream treats that as the yield-and-check-deadline case,
+// so the drain ends on the deadline/cap instead of hanging. The caller owns the
+// fd lifecycle (open/close); this only reads. EINTR also maps to (0,nil) so the
+// bounded loop simply re-reads on its next (deadline-bounded) iteration.
+type rawNonblockReader struct{ fd int }
+
+func (r rawNonblockReader) Read(p []byte) (int, error) {
+	n, err := syscall.Read(r.fd, p)
+	if n < 0 {
+		n = 0
+	}
+	switch err {
+	// NB: on Linux EAGAIN == EWOULDBLOCK (both 11), so list EAGAIN once.
+	case syscall.EAGAIN, syscall.EINTR:
+		// Nothing available right now (or interrupted): degrade to a non-blocking
+		// empty read; boundedReadStream yields and the deadline/cap/kill decide.
+		return n, nil
+	default:
+		return n, err
+	}
+}
 
 // kmsgDefaultMaxBytes caps how many bytes the kmsg tail reads per window. It is a
 // read-only bound: the collector drains at most this much of the currently

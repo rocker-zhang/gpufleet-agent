@@ -84,6 +84,12 @@ func Normalize(agentID string, now time.Time, window time.Duration, obs []Observ
 	// verbatim from collectors (provenance-validated above), appended to the pack
 	// timeline after the derived per-fault legs.
 	var injectedTimeline []*gpufleetv1.TimelineEntry
+	// Source-attributed inputs for the DERIVED gate legs (G1): only facts observed
+	// by a collector that legitimately speaks the leg's source feed faultTimeline,
+	// so one physical collector can never mint two different-source legs.
+	var xidDmesg []*gpufleetv1.XidEvent
+	var ncclReal []*gpufleetv1.NcclEvent
+	eccDCGMSeen := map[string]bool{}
 
 	for _, o := range obs {
 		if !seenSource[o.Source] {
@@ -97,6 +103,22 @@ func Normalize(agentID string, now time.Time, window time.Duration, obs []Observ
 		pack.DcgmSeries = append(pack.DcgmSeries, o.DcgmSeries...)
 		pack.XidEvents = append(pack.XidEvents, o.XidEvents...)
 		pack.NcclEvents = append(pack.NcclEvents, o.NcclEvents...)
+		// Source-attributed inputs for the DERIVED gate legs (G1 provenance
+		// integrity, RULES §B). A derived leg may only be minted from a fact
+		// observed by a collector that legitimately speaks that leg's source — so a
+		// single physical collector can NEVER mint two different-source legs and
+		// forge the gate's independence axis (the same property the pre-formed-leg
+		// guard above enforces for o.Timeline). XID legs only from a DMESG_XID
+		// collector; NCCL legs only from a genuine NCCL collector; the ECC-counter
+		// leg only from a DCGM collector (tracked in the DeviceWindows loop below).
+		// Two legs from one collector therefore necessarily share that collector's
+		// Source, so the engine's >=2-distinct-source veto rejects them → ABSTAIN.
+		if o.Source == gpufleetv1.SignalSource_SIGNAL_SOURCE_DMESG_XID {
+			xidDmesg = append(xidDmesg, o.XidEvents...)
+		}
+		if o.Source == gpufleetv1.SignalSource_SIGNAL_SOURCE_NCCL {
+			ncclReal = append(ncclReal, o.NcclEvents...)
+		}
 		// Carry pre-formed, source-observed timeline signals verbatim. Provenance
 		// integrity (RULES §B/§F): only entries whose Source matches the observation's
 		// Source are accepted, so a collector cannot stamp a leg onto a source it does
@@ -124,6 +146,12 @@ func Normalize(agentID string, now time.Time, window time.Duration, obs []Observ
 		}
 
 		for _, dw := range o.DeviceWindows {
+			// ECC-counter leg provenance (G1): only a genuine DCGM collector's
+			// double-bit delta>0 may later mint the `ecc.dbe.<uuid>`@DCGM leg.
+			if o.Source == gpufleetv1.SignalSource_SIGNAL_SOURCE_DCGM &&
+				dw.ECCDoubleBitKnown && dw.ECCDoubleBitErrs > 0 {
+				eccDCGMSeen[dw.UUID] = true
+			}
 			md, ok := merged[dw.UUID]
 			if !ok {
 				md = &mergedDevice{dw: DeviceWindow{UUID: dw.UUID}}
@@ -161,7 +189,10 @@ func Normalize(agentID string, now time.Time, window time.Duration, obs []Observ
 
 	for _, u := range uuids {
 		dw := merged[u].dw
-		if dw.ECCDoubleBitKnown && dw.ECCDoubleBitErrs > 0 {
+		// Emit the ECC-counter leg only when the double-bit delta was genuinely
+		// observed by a DCGM collector (G1): eccDCGMSeen gates out a counter that
+		// rode in on a non-DCGM observation, so it cannot forge the DCGM leg.
+		if dw.ECCDoubleBitKnown && dw.ECCDoubleBitErrs > 0 && eccDCGMSeen[u] {
 			eccDBEDevices = append(eccDBEDevices, u)
 		}
 		dev := semantics.Device{UUID: dw.UUID, Node: dw.Node, Model: dw.Model}
@@ -264,7 +295,7 @@ func Normalize(agentID string, now time.Time, window time.Duration, obs []Observ
 	// NOT synthesize a corroborator the agent does not collect). The id prefixes +
 	// Sources match the public rca playbook conventions EXACTLY. Deterministic
 	// (sorted) emission for stable verdicts.
-	pack.Timeline = append(pack.Timeline, faultTimeline(pack.XidEvents, pack.NcclEvents, eccDBEDevices, now)...)
+	pack.Timeline = append(pack.Timeline, faultTimeline(xidDmesg, ncclReal, eccDBEDevices, now)...)
 	// Append source-observed, pre-formed legs carried verbatim from collectors.
 	pack.Timeline = append(pack.Timeline, injectedTimeline...)
 
@@ -332,7 +363,15 @@ var eccXids = map[uint32]bool{48: true, 63: true, 64: true, 94: true, 95: true}
 // rca gate matches on, from data the agent GENUINELY collected this window. It is
 // the single honesty chokepoint (RULES §B): each emitted id traces to a real
 // observed fact — an XID line, an NCCL OP_TIMEOUT, or a DCGM ECC double-bit delta
-// — and NO corroborator the agent does not collect is ever synthesized. With the
+// — and NO corroborator the agent does not collect is ever synthesized.
+//
+// PROVENANCE (G1): the inputs are SOURCE-ATTRIBUTED by the caller — `xids` only
+// from a DMESG_XID collector, `nccls` only from a genuine NCCL collector, and
+// `eccDBEDevices` only from a DCGM collector. A leg's stamped Source therefore
+// always equals the source of the collector that observed it, so a single
+// physical collector cannot mint two different-source legs (forged independence);
+// any two legs it produces share its source and the engine's >=2-distinct-source
+// veto collapses them to ABSTAIN. With the
 // current real collectors only ECC has two independent real legs (ECC-XID
 // @DMESG_XID + ECC-counter@DCGM), so only ECC can FIRE; an XID 79 or an NCCL
 // timeout emits its single real leg and the gate correctly ABSTAINs (its second

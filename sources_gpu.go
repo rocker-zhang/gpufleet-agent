@@ -128,7 +128,25 @@ func (s kmsgLogSource) Kmsg() (io.Reader, error) {
 	if path == "" {
 		path = "/dev/kmsg"
 	}
-	return s.readFile(path)
+	// /dev/kmsg is a pollable char device: reading it through *os.File routes via
+	// Go's runtime poller, which PARKS on EAGAIN (waiting for the next kernel
+	// message) so the bounded deadline never fires and the collector hangs
+	// (TASK-0057). Read the raw O_NONBLOCK fd via syscall.Read (rawNonblockReader)
+	// so EAGAIN returns promptly and boundedReadStream's deadline/cap/kill bound
+	// the drain. Read-only (O_RDONLY); the collector never writes. All reading
+	// happens inside boundedReadToReader (it buffers), so closing the fd after it
+	// returns is safe — the returned reader is over already-drained bytes.
+	fd, err := syscall.Open(path, syscall.O_RDONLY|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return nil, nil // unavailable ⇒ degrade, never fatal
+	}
+	defer func() { _ = syscall.Close(fd) }()
+	r, _ := boundedReadToReader(rawNonblockReader{fd: fd}, boundedReadConfig{
+		MaxBytes: s.MaxBytes,
+		Deadline: s.Deadline,
+		Kill:     s.kill.get(),
+	})
+	return r, nil
 }
 
 func (s kmsgLogSource) NCCL() (io.Reader, error) {
@@ -150,7 +168,15 @@ func DefaultCollectors(node string) []Collector {
 }
 
 // Default endpoints, overridable by env, for the lab DaemonSet wiring.
+// Accept BOTH the main-flag env names (GPUFLEET_PROMETHEUS_URL /
+// GPUFLEET_DCGM_EXPORTER_URL, see cmd/agent/main.go) and the short legacy names,
+// preferring the flag names so the mock/DefaultCollectors path honors the same
+// env the operator sets for `--prometheus-url`/`--dcgm-exporter-url` (TASK-0056
+// — previously these diverged, a silent footgun).
 func defaultPromURL() string {
+	if v := os.Getenv("GPUFLEET_PROMETHEUS_URL"); v != "" {
+		return v
+	}
 	if v := os.Getenv("GPUFLEET_PROM_URL"); v != "" {
 		return v
 	}
@@ -158,6 +184,9 @@ func defaultPromURL() string {
 }
 
 func defaultDCGMURL() string {
+	if v := os.Getenv("GPUFLEET_DCGM_EXPORTER_URL"); v != "" {
+		return v
+	}
 	if v := os.Getenv("GPUFLEET_DCGM_URL"); v != "" {
 		return v
 	}
