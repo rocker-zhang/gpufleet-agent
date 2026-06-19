@@ -1,0 +1,29 @@
+# .gitleaks.toml — TASK-0054 secret-scan config for gpufleet OPEN repos.
+#
+# Extends gitleaks' built-in ruleset (real credential patterns) and adds a
+# narrow allowlist so test fixtures / generated keypairs don't false-positive.
+# Keep this conservative: only paths and the synthetic-key markers we KNOW are
+# test material are allowed; everything else is still scanned.
+title = "gpufleet gitleaks config"
+
+[extend]
+# Inherit the upstream default rules (AWS, GCP, generic high-entropy, PEM, etc.).
+useDefault = true
+
+[allowlist]
+description = "Allow test fixtures and synthetically-generated key material."
+# Fixtures, testdata, and generated artifacts never carry real secrets.
+paths = [
+  '''(^|/)testdata/''',
+  '''.*_test\.go$''',
+  '''(^|/)tests?/fixtures?/''',
+  '''(^|/)\.github/''',
+  '''go\.sum$''',
+  '''(^|/)sbom\.spdx\.json$''',
+]
+# Markers used by tests to label deliberately-fake material.
+regexes = [
+  '''(?i)example[_-]?(key|token|secret)''',
+  '''(?i)dummy|fake|sample|placeholder''',
+  '''ed25519\.GenerateKey''',
+]

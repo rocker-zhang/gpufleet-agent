@@ -101,11 +101,13 @@ jobs:
           go-version: "1.26"
           cache: true
       - name: govulncheck
+        # TASK-0054: pin govulncheck (no `@latest`) so a CI run is reproducible
+        # and a new tool release can't silently change the gate's behaviour.
         run: |
-          go install golang.org/x/vuln/cmd/govulncheck@latest
+          go install golang.org/x/vuln/cmd/govulncheck@v1.1.4
           govulncheck ./...
       - name: syft SBOM
-        uses: anchore/sbom-action@v0
+        uses: anchore/sbom-action@v0.17.9
         with:
           format: spdx-json
           output-file: sbom.spdx.json
@@ -115,6 +117,9 @@ jobs:
           name: sbom-${{ github.sha }}
           path: sbom.spdx.json
       - name: gitleaks
-        uses: gitleaks/gitleaks-action@v2
+        uses: gitleaks/gitleaks-action@v2.3.7
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # TASK-0054: pin the ruleset to the repo config (default rules +
+          # testdata/fixture allowlist) so secret scanning is deterministic.
+          GITLEAKS_CONFIG: .gitleaks.toml
