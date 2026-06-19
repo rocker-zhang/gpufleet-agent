@@ -90,6 +90,7 @@ func Normalize(agentID string, now time.Time, window time.Duration, obs []Observ
 	var xidDmesg []*gpufleetv1.XidEvent
 	var ncclReal []*gpufleetv1.NcclEvent
 	eccDCGMSeen := map[string]bool{}
+	eccPromSeen := map[string]bool{}
 	linkErrDCGMSeen := map[string]bool{}
 
 	for _, o := range obs {
@@ -147,11 +148,22 @@ func Normalize(agentID string, now time.Time, window time.Duration, obs []Observ
 		}
 
 		for _, dw := range o.DeviceWindows {
-			// ECC-counter leg provenance (G1): only a genuine DCGM collector's
-			// double-bit delta>0 may later mint the `ecc.dbe.<uuid>`@DCGM leg.
+			// ECC-counter leg provenance (G1): only a genuine metrics collector's
+			// double-bit delta>0 may later mint the `ecc.dbe.<uuid>` leg, attributed to
+			// the OBSERVING collector's source. A DCGM-exporter scrape mints it @DCGM;
+			// a Prometheus-primary node (which reads the SAME counter via an instant
+			// `increase()` query, a genuinely independent metrics path) mints it
+			// @PROMETHEUS. Either is an honest, source-faithful counter leg; the
+			// eccuncorrectable playbook accepts both for the counter leg (its
+			// independent corroborator is the kernel dmesg ECC Xid). A single physical
+			// collector still cannot mint two different-source legs (it has one Source).
 			if o.Source == gpufleetv1.SignalSource_SIGNAL_SOURCE_DCGM &&
 				dw.ECCDoubleBitKnown && dw.ECCDoubleBitErrs > 0 {
 				eccDCGMSeen[dw.UUID] = true
+			}
+			if o.Source == gpufleetv1.SignalSource_SIGNAL_SOURCE_PROMETHEUS &&
+				dw.ECCDoubleBitKnown && dw.ECCDoubleBitErrs > 0 {
+				eccPromSeen[dw.UUID] = true
 			}
 			// link.error leg provenance (G1): only a genuine DCGM collector's
 			// link-error delta>0 may later mint the `link.error.<uuid>`@DCGM leg.
@@ -187,12 +199,14 @@ func Normalize(agentID string, now time.Time, window time.Duration, obs []Observ
 	}
 	sort.Strings(uuids)
 
-	// eccDBEDevices collects, in sorted-UUID order, the devices whose DCGM
-	// uncorrectable (double-bit) ECC counter delta was genuinely observed as >0.
-	// This is the DCGM leg of the ECC-uncorrectable gate signature, emitted below
-	// as `ecc.dbe.<uuid>`@DCGM. A device with no ECC reading (ECCDoubleBitKnown
-	// false) or a zero delta contributes nothing — degrade, never fabricate.
-	var eccDBEDevices []string
+	// eccDBEDevices collects, in sorted-UUID order, the devices whose uncorrectable
+	// (double-bit) ECC counter delta was genuinely observed as >0, each tagged with
+	// the SOURCE of the collector that observed it (DCGM exporter scrape ⇒ @DCGM;
+	// Prometheus-primary increase() query ⇒ @PROMETHEUS). This is the counter leg of
+	// the ECC-uncorrectable gate signature, emitted below as `ecc.dbe.<uuid>` @ that
+	// source. A device with no ECC reading (ECCDoubleBitKnown false) or a zero delta
+	// contributes nothing — degrade, never fabricate.
+	var eccDBEDevices []eccDBEDevice
 	// linkErrDevices collects, in sorted-UUID order, the devices whose DCGM
 	// link-error counter delta was genuinely observed as >0 — the DCGM leg of the
 	// LINK_DEGRADED gate signature, emitted below as `link.error.<uuid>`@DCGM. A
@@ -203,10 +217,21 @@ func Normalize(agentID string, now time.Time, window time.Duration, obs []Observ
 	for _, u := range uuids {
 		dw := merged[u].dw
 		// Emit the ECC-counter leg only when the double-bit delta was genuinely
-		// observed by a DCGM collector (G1): eccDCGMSeen gates out a counter that
-		// rode in on a non-DCGM observation, so it cannot forge the DCGM leg.
-		if dw.ECCDoubleBitKnown && dw.ECCDoubleBitErrs > 0 && eccDCGMSeen[u] {
-			eccDBEDevices = append(eccDBEDevices, u)
+		// observed by a metrics collector (G1): the *Seen maps gate out a counter that
+		// rode in on a source that does not own it. The leg is attributed to the
+		// observing source. DCGM is preferred when both saw it (the lower-latency
+		// local scrape); a Prometheus-primary node with no DCGM scrape mints it
+		// @PROMETHEUS. Exactly one counter leg per device (one Source), so a single
+		// collector can never mint two different-source legs.
+		switch {
+		case dw.ECCDoubleBitKnown && dw.ECCDoubleBitErrs > 0 && eccDCGMSeen[u]:
+			eccDBEDevices = append(eccDBEDevices, eccDBEDevice{
+				uuid: u, source: gpufleetv1.SignalSource_SIGNAL_SOURCE_DCGM,
+			})
+		case dw.ECCDoubleBitKnown && dw.ECCDoubleBitErrs > 0 && eccPromSeen[u]:
+			eccDBEDevices = append(eccDBEDevices, eccDBEDevice{
+				uuid: u, source: gpufleetv1.SignalSource_SIGNAL_SOURCE_PROMETHEUS,
+			})
 		}
 		// Emit the link-error leg only when the delta was genuinely observed by a
 		// DCGM collector (G1): linkErrDCGMSeen gates out a counter that rode in on a
@@ -376,6 +401,15 @@ func sourceShort(s gpufleetv1.SignalSource) string {
 	}
 }
 
+// eccDBEDevice is a device whose uncorrectable (double-bit) ECC counter delta was
+// genuinely observed as >0, tagged with the SOURCE of the observing metrics
+// collector (DCGM exporter scrape ⇒ DCGM; Prometheus increase() query ⇒
+// PROMETHEUS). The counter leg `ecc.dbe.<uuid>` is emitted @ this source.
+type eccDBEDevice struct {
+	uuid   string
+	source gpufleetv1.SignalSource
+}
+
 // eccXids is the public set of NVIDIA XID numbers that denote an uncorrectable
 // (double-bit) GPU memory ECC error. PUBLIC semantics only (RULES §F): these are
 // the documented public ECC XIDs, not externally-sourced or secret codes.
@@ -393,19 +427,29 @@ var eccXids = map[uint32]bool{48: true, 63: true, 64: true, 94: true, 95: true}
 // always equals the source of the collector that observed it, so a single
 // physical collector cannot mint two different-source legs (forged independence);
 // any two legs it produces share its source and the engine's >=2-distinct-source
-// veto collapses them to ABSTAIN. With the current real collectors TWO faults
-// have two independent real legs and can FIRE: ECC (ECC-XID@DMESG_XID +
-// ECC-counter@DCGM) and LINK_DEGRADED (link.error@DCGM from the DCGM exporter +
-// link.degraded.width@PROC from the sysfs PCIe-link collector). An XID 79 or an
-// NCCL timeout still emits only its single real leg and the gate correctly
-// ABSTAINs (its second source — device.lost@DCGM / collective.stall — has no real
-// collector yet).
+// veto collapses them to ABSTAIN. With the current real collectors THREE faults
+// have two independent real legs and can FIRE:
+//   - ECC (ECC-XID@DMESG_XID + ECC-counter@{DCGM exporter scrape | PROMETHEUS
+//     increase() query}). The counter leg is source-faithful to whichever metrics
+//     collector observed it, so ECC fires on a DCGM-fallback OR a Prometheus-
+//     primary node.
+//   - LINK_DEGRADED (link.error@DCGM + link.degraded.{width,speed}@PROC from the
+//     sysfs PCIe-link collector).
+//   - XID79 (dmesg.xid79@DMESG_XID + device.lost@PROC from the sysfs collector,
+//     which observes an NVIDIA GPU whose PCIe link is fully down — fallen off the
+//     bus).
+//
+// An NCCL timeout still emits only its single real leg (nccl.timeout@NCCL from the
+// dedicated NCCL-log collector) and the gate correctly ABSTAINs: its second source
+// — an INDEPENDENT collective.stall witness (scheduler/DCGM/PROC) — has no genuine,
+// non-speculative collector, so we emit ONLY the one real leg and never fabricate
+// the corroborator (RULES §B).
 //
 // Output is deterministic: XID events in pack order (already sorted by the
 // collector), then NCCL events in pack order, then ECC-counter ids in sorted-UUID
 // order. The id prefixes + Sources match the public rca playbook conventions
 // EXACTLY (xid79/eccuncorrectable/nccltimeout).
-func faultTimeline(xids []*gpufleetv1.XidEvent, nccls []*gpufleetv1.NcclEvent, eccDBEDevices, linkErrDevices []string, now time.Time) []*gpufleetv1.TimelineEntry {
+func faultTimeline(xids []*gpufleetv1.XidEvent, nccls []*gpufleetv1.NcclEvent, eccDBEDevices []eccDBEDevice, linkErrDevices []string, now time.Time) []*gpufleetv1.TimelineEntry {
 	var out []*gpufleetv1.TimelineEntry
 
 	// (1) XID-derived dmesg legs @ DMESG_XID.
@@ -454,13 +498,17 @@ func faultTimeline(xids []*gpufleetv1.XidEvent, nccls []*gpufleetv1.NcclEvent, e
 		})
 	}
 
-	// (3) DCGM ECC double-bit counter legs @ DCGM (delta>0, sorted by UUID).
-	for _, u := range eccDBEDevices {
+	// (3) ECC double-bit counter legs (delta>0, sorted by UUID), attributed to the
+	// observing metrics source: a DCGM-exporter scrape ⇒ @DCGM, a Prometheus-primary
+	// increase() query ⇒ @PROMETHEUS. Both are honest, source-faithful counter legs;
+	// the eccuncorrectable playbook accepts either for the counter leg.
+	for _, d := range eccDBEDevices {
 		out = append(out, &gpufleetv1.TimelineEntry{
 			Ts:       timestamppb.New(now),
-			Source:   gpufleetv1.SignalSource_SIGNAL_SOURCE_DCGM,
-			SignalId: "ecc.dbe." + u,
-			Label:    "DCGM uncorrectable (double-bit) ECC counter delta on " + u,
+			Source:   d.source,
+			SignalId: "ecc.dbe." + d.uuid,
+			Label: "uncorrectable (double-bit) ECC counter delta on " + d.uuid +
+				" (" + sourceShort(d.source) + ")",
 		})
 	}
 

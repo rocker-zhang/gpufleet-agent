@@ -163,11 +163,17 @@ func DefaultCollectors(node string) []Collector {
 			PrometheusCollector{BaseURL: defaultPromURL(), Node: node},
 			&DCGMExporterCollector{ScrapeURL: defaultDCGMURL(), Node: node},
 		),
-		LogEventCollector{Src: newKmsgLogSource("/dev/kmsg", defaultNCCLLog()), Node: node},
+		// kmsg ONLY (empty NCCL path): the NCCL stream is collected by the dedicated
+		// NCCLLogCollector below so it is source-attributed @NCCL (G1), not @DMESG_XID.
+		LogEventCollector{Src: newKmsgLogSource("/dev/kmsg", ""), Node: node},
 		// PROC/sysfs PCIe link-health collector (TASK-0053): the INDEPENDENT,
-		// non-DCGM link.degraded leg of the LINK_DEGRADED gate. Read-only sysfs file
-		// reads (no NVML, no network); a non-degraded/absent link emits no leg.
+		// non-DCGM link.degraded leg of the LINK_DEGRADED gate AND the non-dmesg
+		// device.lost leg of the XID79 gate. Read-only sysfs file reads (no NVML, no
+		// network); a healthy/absent link or non-NVIDIA device emits no leg.
 		ProcLinkCollector{Node: node},
+		// Dedicated NCCL-log collector (TASK-0053): the GENUINE NCCL source for the
+		// nccl.timeout@NCCL leg. Read-only file tail; absent log emits no events.
+		NCCLLogCollector{Path: defaultNCCLLog(), Node: node},
 	}
 }
 

@@ -14,11 +14,18 @@ import (
 
 // This file is the build-AGNOSTIC, read-only PROC/sysfs link-health collector
 // (TASK-0053). It reads the PCIe link width/speed each device negotiated from
-// sysfs and, when the CURRENT link is below the device's MAX, emits a pre-formed
-// `link.degraded.width.<token>`@PROC timeline leg. That leg is the INDEPENDENT,
-// non-DCGM corroborator the LINK_DEGRADED gate needs alongside the DCGM
-// `link.error.<uuid>` counter leg — two DISTINCT sources, so the >=2-source gate
-// can FIRE on genuinely-collected telemetry.
+// sysfs and emits two kinds of pre-formed @PROC timeline leg:
+//
+//   - `device.lost.<addr>`     — an NVIDIA GPU whose negotiated link is fully DOWN
+//     (current_link_width == 0 with a known max>0): the GPU has fallen off the
+//     PCIe bus. This is the INDEPENDENT, non-dmesg corroborator the XID79 gate
+//     needs alongside the kernel `dmesg.xid79`@DMESG_XID leg.
+//   - `link.degraded.{width,speed}.<addr>` — the CURRENT link is below the device's
+//     MAX (but still up): the INDEPENDENT, non-DCGM corroborator the LINK_DEGRADED
+//     gate needs alongside the DCGM `link.error.<uuid>` counter leg.
+//
+// Each is two DISTINCT sources from its DCGM/dmesg counterpart, so the >=2-source
+// gate can FIRE on genuinely-collected telemetry.
 //
 // HONESTY (RULES §B): a leg is emitted ONLY when sysfs genuinely reports a
 // current width/speed STRICTLY below the negotiated max. Equal width/speed ⇒ no
@@ -95,6 +102,44 @@ func (c ProcLinkCollector) Collect(now time.Time, window time.Duration) (Observa
 
 	for _, addr := range addrs {
 		dir := filepath.Join(root, addr)
+		// GPU FALLEN OFF THE BUS (device lost), the INDEPENDENT non-dmesg leg of the
+		// XID79 gate. When an NVIDIA GPU drops off the PCIe bus the kernel reports its
+		// negotiated link as fully DOWN: `current_link_width` reads 0 while the device
+		// still advertises a non-zero `max_link_width`. That width-0 (no link at all)
+		// is a CONCRETE, genuinely-observed "device unreachable on the bus" fact —
+		// categorically distinct from a width DOWNGRADE (current>0 but < max, handled
+		// below). HONESTY (RULES §B): we emit `device.lost.<addr>`@PROC ONLY when the
+		// device's `vendor` is NVIDIA (0x10de) AND current width is 0 with a known
+		// max>0, so a non-GPU device, a powered-down (D3) slot we cannot attribute, or
+		// any unreadable attribute degrades (no leg) rather than fabricating a lost
+		// GPU. This is the same provenance-guarded Observation.Timeline channel the
+		// link-degraded legs use; Source=PROC. It is the XID79 corroborator that lets
+		// the gate FIRE on two genuine distinct sources (dmesg.xid79@DMESG_XID +
+		// device.lost@PROC).
+		//
+		// PRECISION GUARDRAIL (do not weaken): current_link_width can also read 0 for a
+		// perfectly healthy GPU in runtime power management (D3cold / ASPM suspend), so
+		// this leg is NOT proof-of-fault on its own. It MUST only ever be consumed as a
+		// CORROBORATOR alongside a genuine kernel dmesg.xid79@DMESG_XID leg (which a
+		// healthy suspended GPU never emits; a GPU under load is in D0, not suspended).
+		// Never promote device.lost@PROC to a standalone-actionable signal without a
+		// stronger basis (e.g. a seen-then-gone transition) — false-positive vector.
+		if isNVIDIADevice(dir) {
+			if curW, ok1 := readLinkWidth(filepath.Join(dir, "current_link_width")); ok1 {
+				if maxW, ok2 := readLinkWidth(filepath.Join(dir, "max_link_width")); ok2 {
+					if maxW > 0 && curW == 0 {
+						obs.Timeline = append(obs.Timeline, &gpufleetv1.TimelineEntry{
+							Ts:       timestamppb.New(now),
+							Source:   gpufleetv1.SignalSource_SIGNAL_SOURCE_PROC,
+							SignalId: "device.lost." + sanitizeToken(addr),
+							Label: "NVIDIA GPU fallen off the PCIe bus (link down, x0 of x" +
+								strconv.Itoa(maxW) + ") at " + addr,
+						})
+						continue // device lost dominates any link-degraded reading.
+					}
+				}
+			}
+		}
 		// PCIe link WIDTH downgrade (current < max). Both must parse for a verdict;
 		// a missing/garbage attribute degrades (no leg) rather than fabricating.
 		if curW, ok1 := readLinkWidth(filepath.Join(dir, "current_link_width")); ok1 {
@@ -126,6 +171,23 @@ func (c ProcLinkCollector) Collect(now time.Time, window time.Duration) (Observa
 		}
 	}
 	return obs, nil
+}
+
+// nvidiaPCIVendorID is the PUBLIC PCI vendor id for NVIDIA, as sysfs reports it
+// in each device's `vendor` attribute. PUBLIC fact only (RULES §F).
+const nvidiaPCIVendorID = "0x10de"
+
+// isNVIDIADevice reports whether the sysfs PCI device dir belongs to NVIDIA, by
+// reading its `vendor` attribute and comparing to nvidiaPCIVendorID. A
+// missing/unreadable/non-matching vendor ⇒ false, so the device.lost leg is only
+// ever attributed to a genuine NVIDIA GPU slot (degrade, never fabricate). Pure
+// read-only file read.
+func isNVIDIADevice(dir string) bool {
+	v, ok := readSysfsAttr(filepath.Join(dir, "vendor"))
+	if !ok {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(v), nvidiaPCIVendorID)
 }
 
 // readLinkWidth reads a sysfs *_link_width attribute (a plain integer lane count,

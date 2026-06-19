@@ -42,6 +42,16 @@ type PromQueries struct {
 	// JobOwner yields the device→job ownership (value carried in the `job` label)
 	// keyed by UUID. Used to resolve the device→job mapping.
 	JobOwner string
+	// ECCDoubleBit yields the per-WINDOW INCREASE of the DCGM uncorrectable
+	// (double-bit) ECC counter (DCGM_FI_DEV_ECC_DBE_VOL_TOTAL) keyed by UUID. It is
+	// the Prometheus-primary leg of the ECC-uncorrectable gate: an increase>0 over
+	// the window, corroborated by an INDEPENDENT kernel/dmesg ECC Xid, fires
+	// FAULT_CLASS_ECC_UNCORRECTABLE on a Prometheus-primary node. The expression
+	// MUST return the per-window DELTA (e.g. increase(<counter>[<range>])), NOT the
+	// lifetime total — a single cumulative reading is not, by itself, evidence of a
+	// NEW error this window (honesty, RULES §B). The collector treats the value as
+	// the already-computed delta and emits the leg only when it is > 0.
+	ECCDoubleBit string
 }
 
 // PromLabels names the Prometheus label keys the collector reads identity from.
@@ -270,6 +280,18 @@ func (c PrometheusCollector) Collect(now time.Time, window time.Duration) (Obser
 	run(c.Queries.TensorActive, func(a *promDevAccum, v float64) {
 		// Value is a ratio in [0,1]; convert to active-seconds over the window.
 		a.dw.TensorActiveSecs, a.dw.TensorActiveKnown = v*ws, true
+	})
+	run(c.Queries.ECCDoubleBit, func(a *promDevAccum, v float64) {
+		// Value is the per-WINDOW INCREASE of the uncorrectable (double-bit) ECC
+		// counter (the query is responsible for the delta, e.g. increase(...[range])).
+		// HONESTY (RULES §B): emit the leg only when the increase is genuinely > 0 —
+		// a zero/absent increase is no new error this window (degrade, never
+		// fabricate). Mark known only on a positive delta so the normalizer never
+		// mints a leg from a 0. Round to the nearest non-negative integer count.
+		if v > 0 {
+			a.dw.ECCDoubleBitErrs = uint64(v + 0.5)
+			a.dw.ECCDoubleBitKnown = true
+		}
 	})
 
 	// JobOwner is read separately because the device→job value lives in a label.

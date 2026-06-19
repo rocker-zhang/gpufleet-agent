@@ -115,6 +115,13 @@ func DefaultPromQueries() PromQueries {
 		PeakFLOPS:     "DCGM_FI_DEV_TENSOR_PEAK_FLOPS",
 		CostPerHour:   "gpufleet_device_cost_usd_per_hour",
 		JobOwner:      "gpufleet_device_job",
+		// Per-window INCREASE of the uncorrectable (double-bit) ECC counter scraped
+		// into Prometheus from dcgm-exporter. increase() yields the server-computed
+		// delta over the range, so the value is already the per-window count (NOT the
+		// lifetime total) — a single cumulative reading is never treated as a new
+		// error (honesty, RULES §B). It is the Prometheus-primary ECC leg; an
+		// operator with a different scrape range overrides the [5m] window.
+		ECCDoubleBit: "increase(DCGM_FI_DEV_ECC_DBE_VOL_TOTAL[5m])",
 	}
 }
 
@@ -187,14 +194,19 @@ func (c RuntimeConfig) Collectors() (cols []Collector, mode CollectorMode) {
 		}
 	}
 
-	// The log/event collector rounds out the >=2-signal picture (dmesg/XID +
-	// NCCL). realLogSource is a build-tagged seam (TASK-0056): on the gpu build it
-	// tails the REAL /dev/kmsg (+ optional NCCL file) so `--collectors real`
-	// genuinely collects the dmesg/XID leg (before this, the real branch hardcoded
-	// a fixture source → read no kmsg → XID79/ECC-XID could never fire on real HW);
-	// on the default build it degrades to a fixture/NCCL-file source (no kmsg).
+	// The log/event collector supplies the dmesg/XID leg. realLogSource is a
+	// build-tagged seam (TASK-0056): on the gpu build it tails the REAL /dev/kmsg so
+	// `--collectors real` genuinely collects the dmesg/XID leg (before this, the real
+	// branch hardcoded a fixture source → read no kmsg → XID79/ECC-XID could never
+	// fire on real HW); on the default build it degrades to a fixture source (no
+	// kmsg). It is passed an EMPTY NCCL path here so it reads kmsg ONLY: the NCCL
+	// stream is collected by the dedicated NCCLLogCollector below, whose Source is
+	// genuinely SIGNAL_SOURCE_NCCL. Routing NCCL through the dmesg/XID log source
+	// (Source=DMESG_XID) would mis-attribute it, and G1 (normalize.go) correctly
+	// gates such NCCL events out of the `nccl.timeout`@NCCL leg — so the dedicated
+	// collector is the ONE genuine NCCL feed (no duplicate events, honest source).
 	// READ-ONLY per-window; a missing/garbage stream degrades, never crashes.
-	logSrc := realLogSource(c.NCCLLogPath)
+	logSrc := realLogSource("")
 
 	// Wrap the metrics chain with the static-spec fill (TASK-0038): when the real
 	// chain leaves peak/cost unknown, the operator's spec completes it (real wins;
@@ -213,11 +225,18 @@ func (c RuntimeConfig) Collectors() (cols []Collector, mode CollectorMode) {
 		metrics,
 		LogEventCollector{Src: logSrc, Node: c.Node},
 		// The PROC/sysfs link-health collector (TASK-0053) is the INDEPENDENT,
-		// non-DCGM `link.degraded.*` leg of the LINK_DEGRADED gate. It is a real
-		// read-only file reader (sysfs PCIe link width/speed) — no network endpoint,
-		// no GPU — so it belongs in the real set unconditionally; a box without sysfs
-		// (or with no degraded link) simply emits no leg and the gate ABSTAINs.
+		// non-DCGM `link.degraded.*` leg of the LINK_DEGRADED gate AND the
+		// non-dmesg `device.lost.*` leg of the XID79 gate (GPU off the bus → link
+		// down). It is a real read-only file reader (sysfs PCIe link width/speed +
+		// vendor) — no network endpoint, no GPU — so it belongs in the real set
+		// unconditionally; a box without sysfs (or a healthy link) emits no leg and
+		// the gate ABSTAINs.
 		ProcLinkCollector{Node: c.Node},
+		// The dedicated NCCL-log collector (TASK-0053) is the GENUINE NCCL source
+		// (Source=SIGNAL_SOURCE_NCCL) for the `nccl.timeout`@NCCL leg, so the leg is
+		// honestly source-attributed (G1) rather than riding the dmesg/XID source. It
+		// is a real read-only file tail; an empty/absent NCCL log emits no events.
+		NCCLLogCollector{Path: c.NCCLLogPath, Node: c.Node},
 	}
 	return cols, CollectorModeReal
 }
