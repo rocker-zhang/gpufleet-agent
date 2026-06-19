@@ -55,7 +55,28 @@ const (
 	// field only (RULES §F). Read-only counter; the agent reports the delta, never
 	// resets it.
 	dcgmSymECCDBETotal = "DCGM_FI_DEV_ECC_DBE_VOL_TOTAL"
+
+	// The link-error counters are the public DCGM fields for NVLink/PCIe
+	// interconnect errors. They are the DCGM leg of the LINK_DEGRADED gate
+	// signature: a cumulative-counter delta>0 over the window, corroborated by an
+	// INDEPENDENT (non-DCGM) link width/speed downgrade, fires
+	// FAULT_CLASS_LINK_DEGRADED. PUBLIC fields only (RULES §F). Read-only counters;
+	// the agent reports the delta, never resets them. Each is summed across the
+	// link-error counters into a single per-device delta (any link error this
+	// window is enough to be the DCGM leg); the leg is `link.error.<uuid>`@DCGM.
+	dcgmSymNVLinkCRCFlitErr = "DCGM_FI_DEV_NVLINK_CRC_FLIT_ERROR_COUNT_TOTAL"
+	dcgmSymNVLinkReplayErr  = "DCGM_FI_DEV_NVLINK_REPLAY_ERROR_COUNT_TOTAL"
+	dcgmSymPCIeReplay       = "DCGM_FI_DEV_PCIE_REPLAY_COUNTER"
 )
+
+// dcgmLinkErrSymbols is the set of cumulative link-error counters whose summed
+// per-device value is delta'd into the LINK_DEGRADED DCGM leg. They are PUBLIC
+// DCGM field symbols only (RULES §F).
+var dcgmLinkErrSymbols = map[string]bool{
+	dcgmSymNVLinkCRCFlitErr: true,
+	dcgmSymNVLinkReplayErr:  true,
+	dcgmSymPCIeReplay:       true,
+}
 
 // dcgmProfilingSymbols is the set of profiling fields subject to the burst cap.
 var dcgmProfilingSymbols = map[string]bool{
@@ -109,6 +130,12 @@ type DCGMExporterCollector struct {
 	// readings, so the FIRST scrape establishes the baseline and reports no delta
 	// (honest — a single reading is not evidence of a new error this window).
 	prevDBE map[string]uint64
+	// prevLinkErr holds the last-seen SUM of the cumulative link-error counters
+	// (NVLink CRC/replay + PCIe replay) per device UUID, so Collect reports the
+	// per-WINDOW delta rather than the lifetime total — mirroring prevDBE exactly,
+	// including the first-scrape baseline (a single cumulative reading is not, by
+	// itself, evidence of a new link error this window).
+	prevLinkErr map[string]uint64
 }
 
 // DefaultProfilingBurstInterval is the default floor between profiling-burst
@@ -199,6 +226,7 @@ func (c *DCGMExporterCollector) Collect(now time.Time, window time.Duration) (Ob
 		return Observation{}, err
 	}
 	c.applyDBEDelta(obs.DeviceWindows)
+	c.applyLinkErrDelta(obs.DeviceWindows)
 	return obs, nil
 }
 
@@ -229,6 +257,37 @@ func (c *DCGMExporterCollector) applyDBEDelta(dws []DeviceWindow) {
 			dw.ECCDoubleBitErrs = 0 // baseline / counter reset ⇒ no delta this window.
 		default:
 			dw.ECCDoubleBitErrs = cur - prev
+		}
+	}
+}
+
+// applyLinkErrDelta converts each device's cumulative link-error counter SUM (as
+// parsed) into the per-WINDOW delta against the last scrape, updating the stored
+// baseline. It mirrors applyDBEDelta EXACTLY: the link-error counters are
+// monotonic, so the delta (not the lifetime total) is the evidence of a NEW link
+// error this window. The first reading establishes the baseline and reports a
+// zero delta (a single cumulative reading is not, by itself, evidence of a new
+// error — honesty, RULES §B). A counter reset (current < prior, e.g. driver
+// reload) is clamped to zero rather than reported as a spurious spike.
+func (c *DCGMExporterCollector) applyLinkErrDelta(dws []DeviceWindow) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.prevLinkErr == nil {
+		c.prevLinkErr = map[string]uint64{}
+	}
+	for i := range dws {
+		dw := &dws[i]
+		if !dw.LinkErrorsKnown {
+			continue
+		}
+		cur := dw.LinkErrors
+		prev, seen := c.prevLinkErr[dw.UUID]
+		c.prevLinkErr[dw.UUID] = cur
+		switch {
+		case !seen || cur < prev:
+			dw.LinkErrors = 0 // baseline / counter reset ⇒ no delta this window.
+		default:
+			dw.LinkErrors = cur - prev
 		}
 	}
 }
@@ -340,6 +399,16 @@ func parseDCGMExposition(r io.Reader, now time.Time, window time.Duration, nodeF
 			if s.value >= 0 {
 				a.dw.ECCDoubleBitErrs = uint64(s.value)
 				a.dw.ECCDoubleBitKnown = true
+			}
+		default:
+			// Cumulative link-error counters (NVLink CRC/replay + PCIe replay) are
+			// SUMMED per device into the lifetime total carried here as "known";
+			// Collect converts the sum to a per-window DELTA against the prior
+			// reading (mirror of the ECC-DBE pattern). A single reading is not, by
+			// itself, evidence of a NEW link error this window.
+			if dcgmLinkErrSymbols[s.symbol] && s.value >= 0 {
+				a.dw.LinkErrors += uint64(s.value)
+				a.dw.LinkErrorsKnown = true
 			}
 		}
 	}

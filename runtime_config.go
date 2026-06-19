@@ -212,6 +212,12 @@ func (c RuntimeConfig) Collectors() (cols []Collector, mode CollectorMode) {
 	cols = []Collector{
 		metrics,
 		LogEventCollector{Src: logSrc, Node: c.Node},
+		// The PROC/sysfs link-health collector (TASK-0053) is the INDEPENDENT,
+		// non-DCGM `link.degraded.*` leg of the LINK_DEGRADED gate. It is a real
+		// read-only file reader (sysfs PCIe link width/speed) — no network endpoint,
+		// no GPU — so it belongs in the real set unconditionally; a box without sysfs
+		// (or with no degraded link) simply emits no leg and the gate ABSTAINs.
+		ProcLinkCollector{Node: c.Node},
 	}
 	return cols, CollectorModeReal
 }

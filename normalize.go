@@ -90,6 +90,7 @@ func Normalize(agentID string, now time.Time, window time.Duration, obs []Observ
 	var xidDmesg []*gpufleetv1.XidEvent
 	var ncclReal []*gpufleetv1.NcclEvent
 	eccDCGMSeen := map[string]bool{}
+	linkErrDCGMSeen := map[string]bool{}
 
 	for _, o := range obs {
 		if !seenSource[o.Source] {
@@ -152,6 +153,12 @@ func Normalize(agentID string, now time.Time, window time.Duration, obs []Observ
 				dw.ECCDoubleBitKnown && dw.ECCDoubleBitErrs > 0 {
 				eccDCGMSeen[dw.UUID] = true
 			}
+			// link.error leg provenance (G1): only a genuine DCGM collector's
+			// link-error delta>0 may later mint the `link.error.<uuid>`@DCGM leg.
+			if o.Source == gpufleetv1.SignalSource_SIGNAL_SOURCE_DCGM &&
+				dw.LinkErrorsKnown && dw.LinkErrors > 0 {
+				linkErrDCGMSeen[dw.UUID] = true
+			}
 			md, ok := merged[dw.UUID]
 			if !ok {
 				md = &mergedDevice{dw: DeviceWindow{UUID: dw.UUID}}
@@ -186,6 +193,12 @@ func Normalize(agentID string, now time.Time, window time.Duration, obs []Observ
 	// as `ecc.dbe.<uuid>`@DCGM. A device with no ECC reading (ECCDoubleBitKnown
 	// false) or a zero delta contributes nothing — degrade, never fabricate.
 	var eccDBEDevices []string
+	// linkErrDevices collects, in sorted-UUID order, the devices whose DCGM
+	// link-error counter delta was genuinely observed as >0 — the DCGM leg of the
+	// LINK_DEGRADED gate signature, emitted below as `link.error.<uuid>`@DCGM. A
+	// device with no link-error reading (LinkErrorsKnown false) or a zero delta
+	// contributes nothing — degrade, never fabricate.
+	var linkErrDevices []string
 
 	for _, u := range uuids {
 		dw := merged[u].dw
@@ -194,6 +207,12 @@ func Normalize(agentID string, now time.Time, window time.Duration, obs []Observ
 		// rode in on a non-DCGM observation, so it cannot forge the DCGM leg.
 		if dw.ECCDoubleBitKnown && dw.ECCDoubleBitErrs > 0 && eccDCGMSeen[u] {
 			eccDBEDevices = append(eccDBEDevices, u)
+		}
+		// Emit the link-error leg only when the delta was genuinely observed by a
+		// DCGM collector (G1): linkErrDCGMSeen gates out a counter that rode in on a
+		// non-DCGM observation, so it cannot forge the DCGM leg.
+		if dw.LinkErrorsKnown && dw.LinkErrors > 0 && linkErrDCGMSeen[u] {
+			linkErrDevices = append(linkErrDevices, u)
 		}
 		dev := semantics.Device{UUID: dw.UUID, Node: dw.Node, Model: dw.Model}
 		out.devices[u] = dev
@@ -295,7 +314,7 @@ func Normalize(agentID string, now time.Time, window time.Duration, obs []Observ
 	// NOT synthesize a corroborator the agent does not collect). The id prefixes +
 	// Sources match the public rca playbook conventions EXACTLY. Deterministic
 	// (sorted) emission for stable verdicts.
-	pack.Timeline = append(pack.Timeline, faultTimeline(xidDmesg, ncclReal, eccDBEDevices, now)...)
+	pack.Timeline = append(pack.Timeline, faultTimeline(xidDmesg, ncclReal, eccDBEDevices, linkErrDevices, now)...)
 	// Append source-observed, pre-formed legs carried verbatim from collectors.
 	pack.Timeline = append(pack.Timeline, injectedTimeline...)
 
@@ -332,6 +351,9 @@ func mergeDeviceWindow(dst *DeviceWindow, src DeviceWindow) {
 	}
 	if src.ECCDoubleBitKnown && !dst.ECCDoubleBitKnown {
 		dst.ECCDoubleBitErrs, dst.ECCDoubleBitKnown = src.ECCDoubleBitErrs, true
+	}
+	if src.LinkErrorsKnown && !dst.LinkErrorsKnown {
+		dst.LinkErrors, dst.LinkErrorsKnown = src.LinkErrors, true
 	}
 }
 
@@ -371,17 +393,19 @@ var eccXids = map[uint32]bool{48: true, 63: true, 64: true, 94: true, 95: true}
 // always equals the source of the collector that observed it, so a single
 // physical collector cannot mint two different-source legs (forged independence);
 // any two legs it produces share its source and the engine's >=2-distinct-source
-// veto collapses them to ABSTAIN. With the
-// current real collectors only ECC has two independent real legs (ECC-XID
-// @DMESG_XID + ECC-counter@DCGM), so only ECC can FIRE; an XID 79 or an NCCL
-// timeout emits its single real leg and the gate correctly ABSTAINs (its second
-// source — device.lost@DCGM / collective.stall — has no real collector yet).
+// veto collapses them to ABSTAIN. With the current real collectors TWO faults
+// have two independent real legs and can FIRE: ECC (ECC-XID@DMESG_XID +
+// ECC-counter@DCGM) and LINK_DEGRADED (link.error@DCGM from the DCGM exporter +
+// link.degraded.width@PROC from the sysfs PCIe-link collector). An XID 79 or an
+// NCCL timeout still emits only its single real leg and the gate correctly
+// ABSTAINs (its second source — device.lost@DCGM / collective.stall — has no real
+// collector yet).
 //
 // Output is deterministic: XID events in pack order (already sorted by the
 // collector), then NCCL events in pack order, then ECC-counter ids in sorted-UUID
 // order. The id prefixes + Sources match the public rca playbook conventions
 // EXACTLY (xid79/eccuncorrectable/nccltimeout).
-func faultTimeline(xids []*gpufleetv1.XidEvent, nccls []*gpufleetv1.NcclEvent, eccDBEDevices []string, now time.Time) []*gpufleetv1.TimelineEntry {
+func faultTimeline(xids []*gpufleetv1.XidEvent, nccls []*gpufleetv1.NcclEvent, eccDBEDevices, linkErrDevices []string, now time.Time) []*gpufleetv1.TimelineEntry {
 	var out []*gpufleetv1.TimelineEntry
 
 	// (1) XID-derived dmesg legs @ DMESG_XID.
@@ -437,6 +461,19 @@ func faultTimeline(xids []*gpufleetv1.XidEvent, nccls []*gpufleetv1.NcclEvent, e
 			Source:   gpufleetv1.SignalSource_SIGNAL_SOURCE_DCGM,
 			SignalId: "ecc.dbe." + u,
 			Label:    "DCGM uncorrectable (double-bit) ECC counter delta on " + u,
+		})
+	}
+
+	// (4) DCGM link-error counter legs @ DCGM (NVLink CRC/replay + PCIe replay
+	// delta>0, sorted by UUID). This is the DCGM leg of the LINK_DEGRADED gate; it
+	// FIRES only when corroborated by an INDEPENDENT non-DCGM `link.degraded.*`
+	// witness (a PROC sysfs link-width downgrade), otherwise the gate ABSTAINs.
+	for _, u := range linkErrDevices {
+		out = append(out, &gpufleetv1.TimelineEntry{
+			Ts:       timestamppb.New(now),
+			Source:   gpufleetv1.SignalSource_SIGNAL_SOURCE_DCGM,
+			SignalId: "link.error." + u,
+			Label:    "DCGM NVLink/PCIe link-error counter delta on " + u,
 		})
 	}
 

@@ -164,6 +164,10 @@ func DefaultCollectors(node string) []Collector {
 			&DCGMExporterCollector{ScrapeURL: defaultDCGMURL(), Node: node},
 		),
 		LogEventCollector{Src: newKmsgLogSource("/dev/kmsg", defaultNCCLLog()), Node: node},
+		// PROC/sysfs PCIe link-health collector (TASK-0053): the INDEPENDENT,
+		// non-DCGM link.degraded leg of the LINK_DEGRADED gate. Read-only sysfs file
+		// reads (no NVML, no network); a non-degraded/absent link emits no leg.
+		ProcLinkCollector{Node: node},
 	}
 }
 

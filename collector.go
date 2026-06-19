@@ -126,4 +126,17 @@ type DeviceWindow struct {
 	// ECCDoubleBitKnown false and no signal is emitted (degrade, never fabricate).
 	ECCDoubleBitErrs  uint64
 	ECCDoubleBitKnown bool
+
+	// LinkErrors is the DCGM interconnect link-error counter DELTA observed over
+	// the window: the SUM of the public NVLink CRC/replay + PCIe replay counters
+	// (DCGM_FI_DEV_NVLINK_CRC_FLIT_ERROR_COUNT_TOTAL,
+	// DCGM_FI_DEV_NVLINK_REPLAY_ERROR_COUNT_TOTAL, DCGM_FI_DEV_PCIE_REPLAY_COUNTER),
+	// delta'd against the prior scrape. Valid only when LinkErrorsKnown; it is the
+	// DCGM leg of the LINK_DEGRADED gate signature. A delta>0 is emitted as a
+	// `link.error.<uuid>`@DCGM timeline signal (normalize.go); a source that does
+	// not read these counters leaves LinkErrorsKnown false and no signal is emitted
+	// (degrade, never fabricate). It needs an INDEPENDENT, non-DCGM link.degraded
+	// corroborator to FIRE.
+	LinkErrors      uint64
+	LinkErrorsKnown bool
 }
