@@ -2,6 +2,7 @@ package reflow
 
 import (
 	"crypto/ed25519"
+	"strings"
 	"encoding/base64"
 	"testing"
 
@@ -65,6 +66,33 @@ func TestBuild_CopiesOnlyDesensitizedFields(t *testing.T) {
 	}
 	if d.GetAgentVersion() != "agent-1.2.3" {
 		t.Errorf("version = %q", d.GetAgentVersion())
+	}
+}
+
+// Desensitization guard: even when the source Verdict is stuffed with rich
+// fields (narration, cited signals, cost), the digest must carry ONLY the four
+// desensitized fields. If a future proto adds a field that Build starts copying,
+// this fails — catching a silent leak before it ships.
+func TestBuild_IgnoresRichVerdictFields(t *testing.T) {
+	v := &gpufleetv1.Verdict{
+		FaultClass:   gpufleetv1.FaultClass_FAULT_CLASS_GPU_FALLEN_OFF_BUS,
+		Signature:    gpufleetv1.GateSignature_GATE_SIGNATURE_UNSPECIFIED,
+		Confidence:   0.99,
+		Narration:    "node-7 GPU-abc123 on host prod-cluster-eu fell off the bus",
+		CitedSignals: []*gpufleetv1.CitedSignal{{SignalId: "dmesg.xid79.GPU-abc123"}},
+	}
+	d := Build(v, 1, "v1.0.0", true)
+	// The digest has exactly five proto fields; only the four desensitized ones
+	// are populated and none echo the identifying narration/cited content.
+	if d.GetFaultClass() != v.GetFaultClass() || d.GetSignature() != v.GetSignature() {
+		t.Errorf("class/sig not carried: %+v", d)
+	}
+	if d.GetAgentVersion() != "v1.0.0" || d.GetCountBucket() != gpufleetv1.CountBucket_COUNT_BUCKET_ONE {
+		t.Errorf("version/bucket wrong: %+v", d)
+	}
+	// Belt-and-suspenders: marshal and assert the identifying strings are absent.
+	if s := d.String(); strings.Contains(s, "abc123") || strings.Contains(s, "prod-cluster") {
+		t.Errorf("digest leaked identifying content: %s", s)
 	}
 }
 

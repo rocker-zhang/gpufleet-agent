@@ -20,6 +20,7 @@ import (
 
 	gpufleetv1 "github.com/rocker-zhang/gpufleet-proto/gen/go/gpufleet/v1"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/durationpb"
 )
 
 // TierEnabled reports whether a consent tier is enabled on this host.
@@ -64,10 +65,12 @@ func Validate(d *gpufleetv1.CollectDirective, enabled TierEnabled) (*gpufleetv1.
 // above the cap is clamped to the cap. The cap is the hard ceiling.
 func clampBudget(req, cap *gpufleetv1.ResourceBudget) *gpufleetv1.ResourceBudget {
 	if cap == nil {
-		// No cap declared: nothing to clamp against, but never invent a budget —
-		// return the request as-is (a capability with no cap is a catalog bug the
-		// catalog test guards against).
-		return req
+		// Defensive: a catalog descriptor MUST declare a budget (the catalog
+		// well-formedness test enforces this). If one ever doesn't, the validator
+		// is the security boundary and must NOT trust that — refuse to pass the
+		// request through unclamped. Return an empty budget so the collector falls
+		// back to its own safe defaults rather than honoring an attacker's budget.
+		return &gpufleetv1.ResourceBudget{}
 	}
 	out := &gpufleetv1.ResourceBudget{
 		MaxDuration:      cap.GetMaxDuration(),
@@ -76,15 +79,25 @@ func clampBudget(req, cap *gpufleetv1.ResourceBudget) *gpufleetv1.ResourceBudget
 		MaxSamples:       cap.GetMaxSamples(),
 	}
 	if req != nil {
-		if d := req.GetMaxDuration(); d != nil && cap.GetMaxDuration() != nil &&
-			d.AsDuration() > 0 && d.AsDuration() < cap.GetMaxDuration().AsDuration() {
-			out.MaxDuration = d
-		}
+		out.MaxDuration = clampDuration(req.GetMaxDuration(), cap.GetMaxDuration())
 		out.MaxCpuMillicores = clampU32(req.GetMaxCpuMillicores(), cap.GetMaxCpuMillicores())
 		out.MaxMapEntries = clampU32(req.GetMaxMapEntries(), cap.GetMaxMapEntries())
 		out.MaxSamples = clampU32(req.GetMaxSamples(), cap.GetMaxSamples())
 	}
 	return out
+}
+
+// clampDuration returns the lower positive of req and cap, mirroring clampU32. A
+// nil cap means "no duration ceiling" → honor the request. A nil/non-positive or
+// over-cap request falls back to the cap.
+func clampDuration(req, cap *durationpb.Duration) *durationpb.Duration {
+	if cap == nil {
+		return req // no ceiling declared → honor the request as-is
+	}
+	if req == nil || req.AsDuration() <= 0 || req.AsDuration() > cap.AsDuration() {
+		return cap
+	}
+	return req
 }
 
 // clampU32 returns the lower positive of req and cap. A req of 0 ("use the

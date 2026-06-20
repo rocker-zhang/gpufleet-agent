@@ -9,6 +9,7 @@ import (
 
 	gpufleetv1 "github.com/rocker-zhang/gpufleet-proto/gen/go/gpufleet/v1"
 	semantics "github.com/rocker-zhang/gpufleet-semantics"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
@@ -130,6 +131,11 @@ func Normalize(agentID string, now time.Time, window time.Duration, obs []Observ
 			if te == nil {
 				continue
 			}
+			// Clone before stamping: te belongs to the collector and may be reused
+			// across cycles. Mutating it in place would corrupt collector state and
+			// make the published (immutable-by-contract) pack alias live collector
+			// memory.
+			te = proto.Clone(te).(*gpufleetv1.TimelineEntry)
 			if te.Source == gpufleetv1.SignalSource_SIGNAL_SOURCE_UNSPECIFIED {
 				te.Source = o.Source
 			}
@@ -142,8 +148,11 @@ func Normalize(agentID string, now time.Time, window time.Duration, obs []Observ
 		for _, m := range o.Mappings {
 			// Last writer wins only if a prior source left job empty; otherwise
 			// keep the first non-empty (deterministic given fixed source order).
+			// Clone on admit: this mapping is later stamped with peak/cost in place
+			// and published, so the pack must own its own copy — never alias the
+			// collector's (possibly cached/shared) DeviceJobMapping pointer.
 			if prev, ok := mappingByDevice[m.DeviceUuid]; !ok || prev.JobId == "" {
-				mappingByDevice[m.DeviceUuid] = m
+				mappingByDevice[m.DeviceUuid] = proto.Clone(m).(*gpufleetv1.DeviceJobMapping)
 			}
 		}
 

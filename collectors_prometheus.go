@@ -286,10 +286,12 @@ func (c PrometheusCollector) Collect(now time.Time, window time.Duration) (Obser
 		// counter (the query is responsible for the delta, e.g. increase(...[range])).
 		// HONESTY (RULES §B): emit the leg only when the increase is genuinely > 0 —
 		// a zero/absent increase is no new error this window (degrade, never
-		// fabricate). Mark known only on a positive delta so the normalizer never
-		// mints a leg from a 0. Round to the nearest non-negative integer count.
-		if v > 0 {
-			a.dw.ECCDoubleBitErrs = uint64(v + 0.5)
+		// fabricate). Round FIRST, then mark known only on a rounded count >= 1: a
+		// fractional delta in (0, 0.5) rounds to 0, and a "known" leg carrying a 0
+		// count would contradict the emit-only-on-increase>0 contract (the
+		// normalizer would mint a leg from a 0).
+		if rounded := uint64(v + 0.5); rounded >= 1 {
+			a.dw.ECCDoubleBitErrs = rounded
 			a.dw.ECCDoubleBitKnown = true
 		}
 	})

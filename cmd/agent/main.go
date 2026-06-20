@@ -192,7 +192,14 @@ func main() {
 	// Headless refresh loop runs regardless of whether any client connects.
 	go func() { _ = d.Run(ctx, *interval) }()
 
-	srv := &http.Server{Addr: *addr, Handler: agent.NewAPI(d).Handler()}
+	srv := &http.Server{
+		Addr:              *addr,
+		Handler:           agent.NewAPI(d).Handler(),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
 	fmt.Fprintf(os.Stderr, "agent: local read-only API listening on %s (GET /signals /cost /verdict /window /healthz); staleness-after=%s\n", *addr, staleAfter)
 	go func() {
 		<-ctx.Done()

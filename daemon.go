@@ -313,8 +313,10 @@ func (d *Daemon) Refresh(ctx context.Context) error {
 		// The cycle published a window from a NON-metrics source (e.g. logs) but the
 		// exporter gave NO device metrics — the last-known cost data is now older.
 		// Keep the prior costState (retain device values, never blank) and age it,
-		// so /cost flags stale rather than serving an empty window as live.
-		d.errs++
+		// so /cost flags stale rather than serving an empty window as live. This is
+		// a log-only / no-exporter-metrics cycle, NOT a collection error — only the
+		// staleness streak advances; d.errs (the hard-error counter on /healthz)
+		// must not be bumped here or it over-reports errors.
 		d.consecFails++
 		d.lastReason = stalenessReason(d.consecFails, firstCollectErr, "no metrics scraped this cycle")
 	}

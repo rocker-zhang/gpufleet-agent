@@ -66,6 +66,15 @@ func (c NCCLLogCollector) reader() (io.Reader, error) {
 		return nil, nil // unavailable ⇒ degrade, never fatal
 	}
 	defer func() { _ = f.Close() }()
+	// Read the TAIL, not the head: NCCL watchdog/timeout lines accumulate at the
+	// END of a long-running job's log. Seek to the last ncclMaxBytes so recent
+	// events are always in-window (a head-bounded read would silently stop firing
+	// nccl.timeout once the log grew past the cap).
+	if fi, statErr := f.Stat(); statErr == nil && fi.Size() > ncclMaxBytes {
+		if _, seekErr := f.Seek(fi.Size()-ncclMaxBytes, io.SeekStart); seekErr != nil {
+			return nil, nil
+		}
+	}
 	b, err := io.ReadAll(io.LimitReader(f, ncclMaxBytes))
 	if err != nil || len(b) == 0 {
 		return nil, nil

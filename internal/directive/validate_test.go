@@ -14,6 +14,36 @@ func tier0Only(t gpufleetv1.ConsentTier) bool {
 	return t == gpufleetv1.ConsentTier_CONSENT_TIER_UNPRIVILEGED
 }
 
+// Defensive: if a descriptor ever lacked a budget cap, the validator must NOT
+// pass the request through unclamped — it returns an empty (collector-default)
+// budget instead.
+func TestClampBudget_NilCapReturnsEmpty(t *testing.T) {
+	got := clampBudget(&gpufleetv1.ResourceBudget{MaxCpuMillicores: 99999, MaxSamples: 1e6}, nil)
+	if got.GetMaxCpuMillicores() != 0 || got.GetMaxSamples() != 0 || got.GetMaxDuration() != nil {
+		t.Errorf("nil cap must yield empty budget, got %+v", got)
+	}
+}
+
+func TestClampDuration(t *testing.T) {
+	cap := durationpb.New(10 * time.Minute)
+	// nil cap → honor request (no ceiling)
+	if d := clampDuration(durationpb.New(time.Hour), nil); d.AsDuration() != time.Hour {
+		t.Errorf("nil cap should honor request, got %v", d.AsDuration())
+	}
+	// over cap → cap
+	if d := clampDuration(durationpb.New(time.Hour), cap); d.AsDuration() != 10*time.Minute {
+		t.Errorf("over-cap should clamp to cap, got %v", d.AsDuration())
+	}
+	// under cap → request
+	if d := clampDuration(durationpb.New(time.Minute), cap); d.AsDuration() != time.Minute {
+		t.Errorf("under-cap should honor request, got %v", d.AsDuration())
+	}
+	// nil/zero request → cap
+	if d := clampDuration(nil, cap); d.AsDuration() != 10*time.Minute {
+		t.Errorf("nil request should use cap, got %v", d.AsDuration())
+	}
+}
+
 func TestValidate_UnknownCapabilityRejected(t *testing.T) {
 	_, _, err := Validate(&gpufleetv1.CollectDirective{CapabilityId: "evil.exfiltrate"}, allTiers)
 	if err == nil {
