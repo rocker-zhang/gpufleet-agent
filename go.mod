@@ -4,8 +4,8 @@ go 1.26.0
 
 require (
 	github.com/rocker-zhang/gpufleet-proto/gen/go v0.2.0
-	github.com/rocker-zhang/gpufleet-rca v0.0.0
-	github.com/rocker-zhang/gpufleet-semantics v0.0.0
+	github.com/rocker-zhang/gpufleet-rca v0.1.0
+	github.com/rocker-zhang/gpufleet-semantics v0.1.0
 	google.golang.org/protobuf v1.36.11
 )
 
@@ -21,8 +21,3 @@ require (
 // module at proto/v0.1.0). For local workspace builds these replace directives
 // point at the sibling repos so the build resolves offline against the vendored
 // real gen types — NOT a hand-rolled mirror.
-replace github.com/rocker-zhang/gpufleet-proto/gen/go => ../proto/gen/go
-
-replace github.com/rocker-zhang/gpufleet-semantics => ../semantics
-
-replace github.com/rocker-zhang/gpufleet-rca => ../rca

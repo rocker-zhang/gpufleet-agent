@@ -468,7 +468,7 @@ func scanExposition(r io.Reader) ([]dcgmParsedSample, error) {
 
 // parseExpositionLine parses one exposition line into (name, labels, value).
 func parseExpositionLine(line string) (string, map[string]string, float64, bool) {
-	name := line
+	var name string
 	labels := map[string]string{}
 
 	if i := strings.IndexByte(line, '{'); i >= 0 {
