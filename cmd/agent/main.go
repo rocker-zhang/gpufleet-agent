@@ -8,7 +8,8 @@
 //   - otherwise: does one collection cycle and prints the window + cost as JSON.
 //
 // It is off-critical-path and never controls, schedules, throttles, or kills a
-// GPU/job. The local API is read-only (GET only); it never originates egress.
+// GPU/job. The local API is read-only (GET only); it never originates egress to
+// the control plane UNLESS -investigate-url is explicitly set (OFF by default).
 package main
 
 import (
@@ -24,6 +25,8 @@ import (
 	"time"
 
 	agent "github.com/rocker-zhang/gpufleet-agent"
+	"github.com/rocker-zhang/gpufleet-agent/internal/investigate"
+	gpufleetv1 "github.com/rocker-zhang/gpufleet-proto/gen/go/gpufleet/v1"
 	"google.golang.org/protobuf/encoding/protojson"
 )
 
@@ -82,6 +85,15 @@ func main() {
 	// for pure degrade-not-fabricate. FLOPs-only: $/hr stays operator-supplied.
 	builtinPeakTable := flag.Bool("builtin-peak-table", envBool("GPUFLEET_BUILTIN_PEAK_TABLE", true),
 		"auto-resolve a missing peak from the built-in datasheet table by GPU modelName (FP16/BF16 dense); operator --peak-tflops/--device-spec-file and real telemetry still win; env GPUFLEET_BUILTIN_PEAK_TABLE")
+
+	// TASK-0061 — multi-round directive escalation loop (D-0011 / M5). When
+	// -investigate-url is set, the agent POSTs its EvidencePack to the control
+	// plane after every refresh cycle and drives the ABSTAIN→FIRE convergence
+	// loop. OFF by default — the daemon stays read-only unless this flag is set.
+	// The Bearer token is read from env GPUFLEET_INVESTIGATE_TOKEN ONLY (no flag)
+	// so it is never visible in the process argument list or flag dumps.
+	investigateURL := flag.String("investigate-url", envStr("GPUFLEET_INVESTIGATE_URL", ""),
+		"control-plane base URL for the directive escalation loop, e.g. https://api.gpufleet.sg; OFF when empty; env GPUFLEET_INVESTIGATE_URL")
 
 	// TASK-0038 — query/label override so an operator aligns to the real
 	// dcgm-exporter schema discovered in recon WITHOUT rebuilding.
@@ -191,6 +203,27 @@ func main() {
 
 	// Headless refresh loop runs regardless of whether any client connects.
 	go func() { _ = d.Run(ctx, *interval) }()
+
+	// TASK-0061 — opt-in egress to the control-plane investigate loop (OFF by
+	// default; only runs when -investigate-url is set). The daemon stays
+	// read-only unless this flag is explicitly provided. The Bearer token is
+	// read from the environment ONLY — never from a flag to keep it out of
+	// ps/arg-list exposure. It is never written to any log.
+	if *investigateURL != "" {
+		// SECURITY: token comes from env only. Never log or print this value.
+		token := os.Getenv("GPUFLEET_INVESTIGATE_TOKEN")
+		ic := &investigate.Client{
+			URL:    *investigateURL,
+			Token:  token,
+			NodeID: *node,
+			// Tier-0 only by default; Tier-1 (ebpf.nvlink.retrans) requires a
+			// separate operator opt-in not yet wired (future step).
+			Consent:  tier0Consent,
+			Executor: investigate.NoopExecutor{},
+		}
+		fmt.Fprintf(os.Stderr, "agent: investigate-url=%q (egress enabled, token=<redacted>)\n", *investigateURL)
+		go runInvestigateLoop(ctx, d, ic, *interval)
+	}
 
 	srv := &http.Server{
 		Addr:              *addr,
@@ -318,4 +351,72 @@ func mustProtoJSON(st *agent.State) []byte {
 		os.Exit(1)
 	}
 	return b
+}
+
+// tier0Consent is the default consent gate for the investigate client: only
+// Tier-0 (UNPRIVILEGED) capabilities are enabled; Tier-1 (PRIVILEGED, e.g.
+// ebpf.nvlink.retrans) requires explicit operator opt-in (not yet wired).
+func tier0Consent(t gpufleetv1.ConsentTier) bool {
+	return t == gpufleetv1.ConsentTier_CONSENT_TIER_UNPRIVILEGED
+}
+
+// runInvestigateLoop runs alongside the daemon's refresh loop and, whenever the
+// daemon has a new window, POSTs its EvidencePack to the control-plane
+// investigate endpoint, driving the multi-round directive escalation loop.
+//
+// It is off-critical-path (RULES §A): errors are logged but never stop the
+// daemon loop or affect a customer job. Each investigate call runs in its own
+// goroutine so a slow round-trip cannot block the next refresh cycle. The loop
+// itself terminates when ctx is cancelled (graceful shutdown).
+func runInvestigateLoop(ctx context.Context, d *agent.Daemon, ic *investigate.Client, interval time.Duration) {
+	if interval <= 0 {
+		interval = 15 * time.Second
+	}
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	var lastRefreshes uint64
+	// Single-flight guard: at most one investigate round-trip in flight at a
+	// time. Without it, an endpoint slower than the tick interval would let
+	// goroutines (and concurrent POSTs) pile up unbounded under steady refreshes.
+	inFlight := make(chan struct{}, 1)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			st := d.Snapshot()
+			if st == nil || st.Window == nil || st.Window.Pack == nil {
+				continue
+			}
+			if st.Refreshes == lastRefreshes {
+				continue // same window as last time; nothing new to investigate.
+			}
+			// Try to acquire the single-flight slot. If a prior investigate is
+			// still running, skip this tick WITHOUT advancing lastRefreshes, so
+			// the newest window is retried once the slot frees up.
+			select {
+			case inFlight <- struct{}{}:
+			default:
+				continue
+			}
+			lastRefreshes = st.Refreshes
+			pack := st.Window.Pack
+			// Run investigate in its own goroutine: a slow network round-trip must
+			// not block the next refresh tick or stall the daemon's local API.
+			go func(p *gpufleetv1.EvidencePack) {
+				defer func() { <-inFlight }()
+				ictx, cancel := context.WithTimeout(ctx, 30*time.Second)
+				defer cancel()
+				verdict, err := ic.Investigate(ictx, p)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "agent: investigate: %v\n", err)
+					return
+				}
+				if verdict != nil {
+					fmt.Fprintf(os.Stderr, "agent: investigate: verdict=%s\n",
+						verdict.GetFaultClass())
+				}
+			}(pack)
+		}
+	}
 }
