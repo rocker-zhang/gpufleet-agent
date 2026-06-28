@@ -1,0 +1,34 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+# CodeRabbit AI review config for this module.
+# Remote backstop only — does not replace the project's local pre-publish review.
+language: en-US
+early_access: false
+reviews:
+  profile: chill
+  request_changes_workflow: false
+  high_level_summary: true
+  poem: false
+  review_status: true
+  collapse_walkthrough: false
+  auto_review:
+    enabled: true
+    drafts: false
+    base_branches:
+      - main
+  path_instructions:
+    - path: "**/*"
+      instructions: >-
+        Privacy backstop: flag anything that could deanonymize the maintainer or
+        leak private infrastructure into a public repo — real non-loopback IP
+        addresses (loopback / RFC5737 / placeholders are fine); real hostnames,
+        machine identifiers, or hardware strings tied to a specific private
+        machine; a real legal name or personal email; absolute filesystem paths
+        embedding a local username; or pointers to private/internal repos.
+    - path: "**/*.go"
+      instructions: >-
+        Go review: flag data races, unchecked errors, goroutine leaks, and any
+        network call or write on a component documented as read-only /
+        off-critical-path. A component must never synthesize a second independent
+        signal from a single source.
+chat:
+  auto_reply: true
