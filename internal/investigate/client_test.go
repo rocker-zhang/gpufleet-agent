@@ -376,8 +376,9 @@ func TestLoopConsentGatesDirectives(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	// Executor would add entries if called. We verify it is NOT called.
-	exec := &echoExecutor{
+	// Executor records every directive it receives. We assert it receives NONE:
+	// the consent gate must refuse the Tier-1 directive before it reaches here.
+	exec := &capturingExecutor{
 		entries: []*gpufleetv1.TimelineEntry{
 			{
 				Ts:       now,
@@ -398,10 +399,12 @@ func TestLoopConsentGatesDirectives(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Investigate: %v", err)
 	}
-	// With Tier-1 refused, the executor was never called, 0 entries added
-	// → no-progress → loop terminates on first round with ABSTAIN.
-	// (The test passes as long as it terminates without panic; the key is
-	// the executor was not called after the consent gate refused ebpf.nvlink.retrans.)
+	// The real assertion: the consent gate must have refused the Tier-1
+	// ebpf.nvlink.retrans directive BEFORE it reached the executor. If the gate
+	// were broken, the executor would have recorded the directive here.
+	if len(exec.seen) != 0 {
+		t.Fatalf("consent gate leaked %d directive(s) to the executor; Tier-1 must be refused under Tier-0 consent: %+v", len(exec.seen), exec.seen)
+	}
 }
 
 // TestInvestigateLoopEgressGate verifies the opt-in egress gate: no HTTP

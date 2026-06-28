@@ -210,12 +210,21 @@ func (c *Client) post(ctx context.Context, pack *gpufleetv1.EvidencePack) (*gpuf
 	defer httpResp.Body.Close()
 
 	const maxBody = 1 << 20 // 1 MiB
-	raw, err := io.ReadAll(io.LimitReader(httpResp.Body, maxBody))
+	// Read one extra byte so an over-large body is detected rather than silently
+	// truncated (a truncated JSON would otherwise fail to decode with a confusing
+	// error, or worse, decode partially).
+	raw, err := io.ReadAll(io.LimitReader(httpResp.Body, maxBody+1))
 	if err != nil {
 		return nil, fmt.Errorf("read response body: %w", err)
 	}
+	if len(raw) > maxBody {
+		return nil, fmt.Errorf("response body exceeds %d bytes", maxBody)
+	}
 	if httpResp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("server returned HTTP %d: %.200s", httpResp.StatusCode, string(raw))
+		// SECURITY: never echo the response body into the error. A misbehaving or
+		// hostile control plane could reflect our request headers/body — including
+		// the bearer token — back to us, and this error is logged.
+		return nil, fmt.Errorf("server returned HTTP %d", httpResp.StatusCode)
 	}
 
 	resp := &gpufleetv1.InvestigateResponse{}

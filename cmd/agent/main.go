@@ -375,6 +375,10 @@ func runInvestigateLoop(ctx context.Context, d *agent.Daemon, ic *investigate.Cl
 	t := time.NewTicker(interval)
 	defer t.Stop()
 	var lastRefreshes uint64
+	// Single-flight guard: at most one investigate round-trip in flight at a
+	// time. Without it, an endpoint slower than the tick interval would let
+	// goroutines (and concurrent POSTs) pile up unbounded under steady refreshes.
+	inFlight := make(chan struct{}, 1)
 	for {
 		select {
 		case <-ctx.Done():
@@ -387,11 +391,20 @@ func runInvestigateLoop(ctx context.Context, d *agent.Daemon, ic *investigate.Cl
 			if st.Refreshes == lastRefreshes {
 				continue // same window as last time; nothing new to investigate.
 			}
+			// Try to acquire the single-flight slot. If a prior investigate is
+			// still running, skip this tick WITHOUT advancing lastRefreshes, so
+			// the newest window is retried once the slot frees up.
+			select {
+			case inFlight <- struct{}{}:
+			default:
+				continue
+			}
 			lastRefreshes = st.Refreshes
 			pack := st.Window.Pack
 			// Run investigate in its own goroutine: a slow network round-trip must
 			// not block the next refresh tick or stall the daemon's local API.
 			go func(p *gpufleetv1.EvidencePack) {
+				defer func() { <-inFlight }()
 				ictx, cancel := context.WithTimeout(ctx, 30*time.Second)
 				defer cancel()
 				verdict, err := ic.Investigate(ictx, p)
