@@ -281,7 +281,7 @@ func TestProfilingBurstRateCapped(t *testing.T) {
 	var scrapes int
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		scrapes++
-		w.Write([]byte("DCGM_FI_PROF_PIPE_TENSOR_ACTIVE{UUID=\"GPU-x\",Hostname=\"n\"} 0.5\n"))
+		_, _ = w.Write([]byte("DCGM_FI_PROF_PIPE_TENSOR_ACTIVE{UUID=\"GPU-x\",Hostname=\"n\"} 0.5\n"))
 	}))
 	defer srv.Close()
 
@@ -327,7 +327,7 @@ func TestProfilingBurstRateCapped(t *testing.T) {
 // limiter, aligned to the customer's existing interval.
 func TestProfilingNoBurstNotCapped(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Write([]byte("DCGM_FI_PROF_PIPE_TENSOR_ACTIVE{UUID=\"GPU-x\",Hostname=\"n\"} 0.5\n"))
+		_, _ = w.Write([]byte("DCGM_FI_PROF_PIPE_TENSOR_ACTIVE{UUID=\"GPU-x\",Hostname=\"n\"} 0.5\n"))
 	}))
 	defer srv.Close()
 	c := &DCGMExporterCollector{ScrapeURL: srv.URL} // ProfilingBurst=false
@@ -430,7 +430,7 @@ func TestPrometheusHardFailIsError(t *testing.T) {
 		t.Fatalf("expected error from unreachable Prometheus")
 	}
 	// And a malformed BaseURL is rejected.
-	if _, err := url.Parse("://bad"); err == nil {
+	if _, err := url.Parse("://bad"); err == nil { //nolint:staticcheck // intentionally malformed URL
 		t.Skip("url.Parse unexpectedly accepted; skip")
 	}
 }
